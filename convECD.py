@@ -10,9 +10,9 @@ st.markdown("<style>.cont-row {border-bottom: 1px solid #f0f2f6; padding: 15px 0
 st.title("🛠️ Conversor de Lançamentos ECD")
 
 # --- SIDEBAR ---
-st.sidebar.header("Configurações")
+st.sidebar.header("Upload")
 file_sped = st.sidebar.file_uploader("1. Arquivo SPED (TXT)", type=["txt"])
-usar_padrao = st.sidebar.checkbox("Usar Plano de Contas Padrão UNSAO?", value=True)
+usar_padrao = st.sidebar.checkbox("Usar Plano de Contas Padrão?", value=True)
 
 df_novo = None
 if usar_padrao:
@@ -50,31 +50,50 @@ if file_sped and df_novo is not None:
 
     content_sped = ler_arquivo_texto(file_sped)
     
+    # PASSO 1: Identificar contas usadas no I250
     contas_com_movimento = set()
     for line in content_sped:
         if "|I250|" in line:
             reg = line.split("|")
             if len(reg) > 2:
+                # No I250 a conta é sempre o terceiro campo após o split
                 contas_com_movimento.add(reg[2].strip())
 
+    # PASSO 2: Mapear essas contas no I050 (Busca Dinâmica)
     contas_origem_data = []
     for line in content_sped:
         if "|I050|" in line:
             reg = line.split("|")
-            if len(reg) > 8:
-                cod_i050 = reg[6].strip()
-                if cod_i050 in contas_com_movimento:
+            if len(reg) > 6:
+                # Tenta localizar qual campo do I050 bate com as contas do I250
+                # O código pode estar na posição 5, 6 ou até 7 dependendo do sistema
+                cod_encontrado = None
+                for i in [5, 6, 7]:
+                    if i < len(reg) and reg[i].strip() in contas_com_movimento:
+                        cod_encontrado = reg[i].strip()
+                        pos_classif = i
+                        break
+                
+                if cod_encontrado:
+                    # Nome costuma estar 2 ou 3 posições à frente do código
+                    # Vamos buscar o primeiro campo de texto longo que parece um nome
+                    nome_conta = "Sem Nome"
+                    for j in range(pos_classif + 1, len(reg)):
+                        if len(reg[j]) > 3 and not reg[j].replace(".","").isnumeric():
+                            nome_conta = reg[j].strip()
+                            break
+
                     contas_origem_data.append({
-                        "cod": cod_i050, 
-                        "classif": reg[6], 
-                        "nome": reg[8].strip(), 
-                        "grupo": reg[6][0] if len(reg[6]) > 0 else ""
+                        "cod": cod_encontrado, 
+                        "classif": reg[pos_classif].strip(), 
+                        "nome": nome_conta, 
+                        "grupo": reg[pos_classif][0] if len(reg[pos_classif]) > 0 else ""
                     })
     
     df_origem = pd.DataFrame(contas_origem_data).drop_duplicates()
 
     if not df_origem.empty:
-        st.subheader(f"🔗 Mapeamento ({len(df_origem)} contas detectadas)")
+        st.subheader(f"🔗 Mapeamento ({len(df_origem)} contas com movimento)")
         de_para_map = {}
 
         for idx, row in df_origem.iterrows():
@@ -90,24 +109,13 @@ if file_sped and df_novo is not None:
                 
                 with col_destino:
                     lista_nomes = df_busca['Nome'].tolist()
-                    
-                    # MUDANÇA AQUI: scorer=fuzz.token_set_ratio é melhor para nomes que contêm partes de outros
                     res_fuzz = process.extractOne(row['nome'], lista_nomes, scorer=fuzz.token_set_ratio)
                     match_nome, score = res_fuzz[0], res_fuzz[1]
                     
-                    # AJUSTE: Reduzi o corte para 70% para ser mais flexível com Bradesco/Itaú/etc
-                    CORTE = 70 
-                    
                     opcoes = ["-- SELECIONE --", "📝 -- DIGITAR MANUALMENTE --"] + df_busca['Display'].tolist()
+                    idx_padrao = opcoes.index(df_busca[df_busca['Nome'] == match_nome].iloc[0]['Display']) if score >= 70 else 0
                     
-                    if score >= CORTE:
-                        sugestao_full = df_busca[df_busca['Nome'] == match_nome].iloc[0]['Display']
-                        idx_padrao = opcoes.index(sugestao_full)
-                        st.success(f"✅ Sugestão: {score}%")
-                    else:
-                        idx_padrao = 0
-                        st.warning(f"⚠️ Similaridade baixa ({score}%)")
-
+                    st.caption(f"✅ Sugestão: {score}%" if score >= 70 else "⚠️ Similaridade baixa")
                     escolha = st.selectbox(f"sel_{row['cod']}", options=opcoes, index=idx_padrao, key=f"sel_{row['cod']}", label_visibility="collapsed")
                     
                     if escolha == "📝 -- DIGITAR MANUALMENTE --":
@@ -123,14 +131,14 @@ if file_sped and df_novo is not None:
             for line in content_sped:
                 if "|I250|" in line:
                     reg = line.split("|")
-                    if reg[2] in de_para_map:
+                    if len(reg) > 2 and reg[2] in de_para_map:
                         reg[2] = de_para_map[reg[2]]
                     saida.append("|".join(reg))
                 else:
                     saida.append(line)
-            st.success("Arquivo pronto!")
+            st.success("Arquivo processado!")
             st.download_button("💾 Baixar SPED", "\n".join(saida), "SPED_CONVERTIDO.txt", use_container_width=True)
     else:
-        st.error("Nenhuma conta do I250 foi localizada no I050.")
+        st.error("Nenhuma conta do I250 foi localizada no I050. Verifique se o código da conta no lançamento existe no Plano de Contas.")
 else:
     st.info("Aguardando arquivos...")
