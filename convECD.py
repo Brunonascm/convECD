@@ -10,7 +10,7 @@ st.markdown("<style>.cont-row {border-bottom: 1px solid #f0f2f6; padding: 15px 0
 st.title("🛠️ Conversor de Lançamentos ECD")
 
 # --- SIDEBAR ---
-st.sidebar.header("Upload")
+st.sidebar.header("Configurações")
 file_sped = st.sidebar.file_uploader("1. Arquivo SPED (TXT)", type=["txt"])
 usar_padrao = st.sidebar.checkbox("Usar Plano de Contas Padrão?", value=True)
 
@@ -56,7 +56,6 @@ if file_sped and df_novo is not None:
         if "|I250|" in line:
             reg = line.split("|")
             if len(reg) > 2:
-                # No I250 a conta é sempre o terceiro campo após o split
                 contas_com_movimento.add(reg[2].strip())
 
     # PASSO 2: Mapear essas contas no I050 (Busca Dinâmica)
@@ -65,9 +64,8 @@ if file_sped and df_novo is not None:
         if "|I050|" in line:
             reg = line.split("|")
             if len(reg) > 6:
-                # Tenta localizar qual campo do I050 bate com as contas do I250
-                # O código pode estar na posição 5, 6 ou até 7 dependendo do sistema
                 cod_encontrado = None
+                pos_classif = -1
                 for i in [5, 6, 7]:
                     if i < len(reg) and reg[i].strip() in contas_com_movimento:
                         cod_encontrado = reg[i].strip()
@@ -75,8 +73,6 @@ if file_sped and df_novo is not None:
                         break
                 
                 if cod_encontrado:
-                    # Nome costuma estar 2 ou 3 posições à frente do código
-                    # Vamos buscar o primeiro campo de texto longo que parece um nome
                     nome_conta = "Sem Nome"
                     for j in range(pos_classif + 1, len(reg)):
                         if len(reg[j]) > 3 and not reg[j].replace(".","").isnumeric():
@@ -93,9 +89,10 @@ if file_sped and df_novo is not None:
     df_origem = pd.DataFrame(contas_origem_data).drop_duplicates()
 
     if not df_origem.empty:
-        st.subheader(f"🔗 Mapeamento ({len(df_origem)} contas com movimento)")
+        st.subheader(f"🔗 Mapeamento de Contas")
         de_para_map = {}
 
+        # Interface de Mapeamento
         for idx, row in df_origem.iterrows():
             with st.container():
                 col_origem, col_destino = st.columns([1, 1])
@@ -105,7 +102,7 @@ if file_sped and df_novo is not None:
                 
                 with col_origem:
                     st.markdown(f"**{row['nome']}**")
-                    st.caption(f"Cod no SPED: {row['cod']}")
+                    st.caption(f"Cod no SPED: {row['cod']} | Grupo: {grupo_atual}")
                 
                 with col_destino:
                     lista_nomes = df_busca['Nome'].tolist()
@@ -125,7 +122,20 @@ if file_sped and df_novo is not None:
                         de_para_map[row['cod']] = df_busca[df_busca['Display'] == escolha].iloc[0]['Código']
                 st.markdown("---")
 
-        pendentes = len(df_origem) - len(de_para_map)
+        # --- RESUMO E FINALIZAÇÃO ---
+        st.divider()
+        total_contas = len(df_origem)
+        mapeadas = len(de_para_map)
+        pendentes = total_contas - mapeadas
+
+        col_res1, col_res2, col_res3 = st.columns(3)
+        col_res1.metric("Total de Contas", total_contas)
+        col_res2.metric("Mapeadas", mapeadas, delta=f"{mapeadas/total_contas:.0%}", delta_color="normal")
+        col_res3.metric("Pendentes", pendentes, delta=f"-{pendentes}", delta_color="inverse")
+
+        if pendentes > 0:
+            st.warning(f"⚠️ Atenção: Faltam {pendentes} contas para configurar antes de gerar o arquivo.")
+        
         if st.button("🚀 Gerar Novo SPED", disabled=(pendentes > 0), use_container_width=True):
             saida = []
             for line in content_sped:
@@ -136,9 +146,9 @@ if file_sped and df_novo is not None:
                     saida.append("|".join(reg))
                 else:
                     saida.append(line)
-            st.success("Arquivo processado!")
-            st.download_button("💾 Baixar SPED", "\n".join(saida), "SPED_CONVERTIDO.txt", use_container_width=True)
+            st.success("Arquivo processado com sucesso!")
+            st.download_button("💾 Baixar SPED Convertido", "\n".join(saida), "SPED_CONVERTIDO.txt", use_container_width=True)
     else:
-        st.error("Nenhuma conta do I250 foi localizada no I050. Verifique se o código da conta no lançamento existe no Plano de Contas.")
+        st.error("Nenhuma conta do I250 foi localizada no I050.")
 else:
-    st.info("Aguardando arquivos...")
+    st.info("Aguardando arquivos para iniciar o processamento.")
