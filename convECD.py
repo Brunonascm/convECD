@@ -8,12 +8,12 @@ st.set_page_config(page_title="DE/PARA SPED ECD", layout="wide")
 st.markdown("<style>.cont-row {border-bottom: 1px solid #f0f2f6; padding: 15px 0px;}</style>", unsafe_allow_html=True)
 
 st.title("🛠️ Conversor de Lançamentos ECD")
-st.info("Versão 1.0 Beta")
+st.info("Foco: Substituição pelo **Código Reduzido** com indicadores de progresso.")
 
 # --- SIDEBAR ---
 st.sidebar.header("Configurações")
 file_sped = st.sidebar.file_uploader("1. Arquivo SPED (TXT)", type=["txt"])
-usar_padrao = st.sidebar.checkbox("Usar Plano de Contas Padrão UNSAO?", value=True)
+usar_padrao = st.sidebar.checkbox("Usar Plano de Contas Padrão?", value=True)
 
 # FILTRO DE VISUALIZAÇÃO
 st.sidebar.divider()
@@ -107,11 +107,9 @@ if file_sped and df_novo is not None:
     if not df_origem.empty:
         st.subheader("🔗 Mapeamento de Contas")
         
-        # Inicializa o dicionário de mapeamento no estado da sessão para persistir entre filtros
         if 'de_para_map' not in st.session_state:
             st.session_state.de_para_map = {}
 
-        # Interface de Mapeamento
         for idx, row in df_origem.iterrows():
             cod_atual = row['cod']
             foi_mapeada = cod_atual in st.session_state.de_para_map
@@ -139,21 +137,24 @@ if file_sped and df_novo is not None:
                     
                     opcoes = ["-- SELECIONE --", "📝 -- DIGITAR MANUALMENTE --"] + df_busca['Display'].tolist()
                     
-                    # Tenta recuperar o que já foi selecionado para não perder ao filtrar
+                    # Recuperação de índice e exibição de similaridade
                     idx_padrao = 0
                     if foi_mapeada:
-                        # Se já mapeamos, tentamos achar o índice do valor no display
                         valor_mapeado = st.session_state.de_para_map[cod_atual]
-                        # Tenta achar o display que corresponde ao código reduzido mapeado
                         try:
                             display_gravado = df_busca[df_busca['Código'] == valor_mapeado].iloc[0]['Display']
                             idx_padrao = opcoes.index(display_gravado)
+                            st.caption(f"📌 Mapeado (Score original: {score}%)")
                         except:
-                            idx_padrao = 1 # Cai no manual se não achar na lista
-                    elif score >= 70:
-                        sugestao_full = df_busca[df_busca['Nome'] == match_nome].iloc[0]['Display']
-                        idx_padrao = opcoes.index(sugestao_full)
-                        st.caption(f"✅ Sugestão: {score}%")
+                            idx_padrao = 1
+                            st.caption(f"📝 Digitado Manualmente")
+                    else:
+                        if score >= 70:
+                            sugestao_full = df_busca[df_busca['Nome'] == match_nome].iloc[0]['Display']
+                            idx_padrao = opcoes.index(sugestao_full)
+                            st.success(f"✅ Sugestão: {score}%")
+                        else:
+                            st.warning(f"⚠️ Similaridade baixa ({score}%)")
                     
                     escolha = st.selectbox(f"sel_{cod_atual}", options=opcoes, index=idx_padrao, key=f"sel_{cod_atual}", label_visibility="collapsed")
                     
@@ -166,7 +167,6 @@ if file_sped and df_novo is not None:
                         cod_reduzido = df_busca[df_busca['Display'] == escolha].iloc[0]['Código']
                         st.session_state.de_para_map[cod_atual] = str(cod_reduzido)
                     else:
-                        # Se voltar para "Selecione", remove do mapa
                         if cod_atual in st.session_state.de_para_map:
                             del st.session_state.de_para_map[cod_atual]
                 st.markdown("---")
@@ -184,7 +184,7 @@ if file_sped and df_novo is not None:
         col_m3.metric("Pendentes", pendentes, f"-{pendentes}", delta_color="inverse")
 
         if pendentes > 0:
-            st.warning(f"⚠️ Existem {pendentes} contas pendentes. Mude o filtro para 'Apenas Pendentes' para agilizar.")
+            st.warning(f"⚠️ Existem {pendentes} contas pendentes.")
         
         if st.button("🚀 Gerar Novo SPED", disabled=(pendentes > 0), use_container_width=True):
             saida = []
