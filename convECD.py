@@ -144,7 +144,7 @@ if file_sped and df_novo is not None:
                         try:
                             display_gravado = df_busca[df_busca['Código'] == valor_mapeado].iloc[0]['Display']
                             idx_padrao = opcoes.index(display_gravado)
-                            st.success(f"📌 Mapeado (Score original: {score}%)")
+                            st.success(f"📌 Mapeado (Score: {score}%)")
                         except:
                             idx_padrao = 1
                             st.info(f"📝 Digitado Manualmente")
