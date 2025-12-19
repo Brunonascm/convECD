@@ -8,12 +8,12 @@ st.set_page_config(page_title="DE/PARA SPED ECD", layout="wide")
 st.markdown("<style>.cont-row {border-bottom: 1px solid #f0f2f6; padding: 15px 0px;}</style>", unsafe_allow_html=True)
 
 st.title("🛠️ Conversor de Lançamentos ECD")
-st.info("Foco: Substituição pelo **Código Reduzido** com indicadores de progresso.")
+st.info("Versão 1.0")
 
 # --- SIDEBAR ---
 st.sidebar.header("Configurações")
 file_sped = st.sidebar.file_uploader("1. Arquivo SPED (TXT)", type=["txt"])
-usar_padrao = st.sidebar.checkbox("Usar Plano de Contas Padrão UNSAO?", value=True)
+usar_padrao = st.sidebar.checkbox("Usar Plano de Contas Padrão?", value=True)
 
 df_novo = None
 if usar_padrao:
@@ -28,6 +28,16 @@ if usar_padrao:
         st.sidebar.warning("Arquivo 'plano_padrao.xlsx' não encontrado.")
 else:
     file_excel = st.sidebar.file_uploader("2. Subir Novo Plano (Excel)", type=["xlsx"])
+    
+    # --- CAMPO DE INFORMAÇÕES DO LEIAUTE ---
+    with st.sidebar.expander("ℹ️ Informações de Leiaute"):
+        st.markdown("""
+        O arquivo Excel deve estar na seguinte ordem **sem cabeçalho**:
+        - **Coluna A:** Código Reduzido (o que será gravado)
+        - **Coluna B:** Classificação (ex: 1.01.01...)
+        - **Coluna C:** Nome da Conta
+        """)
+        
     if file_excel:
         df_novo = pd.read_excel(file_excel, header=None).iloc[:, [0, 1, 2]]
         df_novo.columns = ['Código', 'Classificação', 'Nome']
