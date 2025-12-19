@@ -13,7 +13,7 @@ st.info("Versão 1.0")
 # --- SIDEBAR ---
 st.sidebar.header("Configurações")
 file_sped = st.sidebar.file_uploader("1. Arquivo SPED (TXT)", type=["txt"])
-usar_padrao = st.sidebar.checkbox("Usar Plano de Contas Padrão?", value=True)
+usar_padrao = st.sidebar.checkbox("Usar Plano de Contas Padrão UNSAO?", value=True)
 
 df_novo = None
 if usar_padrao:
