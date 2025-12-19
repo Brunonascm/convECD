@@ -8,19 +8,18 @@ st.set_page_config(page_title="DE/PARA SPED ECD", layout="wide")
 st.markdown("<style>.cont-row {border-bottom: 1px solid #f0f2f6; padding: 15px 0px;}</style>", unsafe_allow_html=True)
 
 st.title("🛠️ Conversor de Lançamentos ECD")
-st.info("Versão 1.0")
+st.info("Foco: Substituição pelo **Código Reduzido** com indicadores de progresso.")
 
 # --- SIDEBAR ---
 st.sidebar.header("Configurações")
 file_sped = st.sidebar.file_uploader("1. Arquivo SPED (TXT)", type=["txt"])
-usar_padrao = st.sidebar.checkbox("Usar Plano de Contas Padrão?", value=True)
+usar_padrao = st.sidebar.checkbox("Usar Plano de Contas Padrão UNSAO?", value=True)
 
 df_novo = None
 if usar_padrao:
     caminho_padrao = "plano_padrao.xlsx"
     if os.path.exists(caminho_padrao):
         try:
-            # Col A: Código (Reduzido), Col B: Classificação, Col C: Nome
             df_novo = pd.read_excel(caminho_padrao, header=None).iloc[:, [0, 1, 2]]
             df_novo.columns = ['Código', 'Classificação', 'Nome']
         except:
@@ -47,14 +46,12 @@ def ler_arquivo_texto(file):
 # --- Lógica Principal ---
 if file_sped and df_novo is not None:
     df_novo = df_novo.astype(str)
-    # Grupo extraído da Classificação (Coluna B)
     df_novo['Grupo'] = df_novo['Classificação'].str[0]
-    # Display mostra Classificação e Nome, mas o 'Código' (Coluna A) será o valor gravado
     df_novo['Display'] = df_novo['Classificação'] + " - " + df_novo['Nome']
 
     content_sped = ler_arquivo_texto(file_sped)
     
-    # PASSO 1: Identificar contas usadas no I250
+    # PASSO 1: Identificar movimento no I250
     contas_com_movimento = set()
     for line in content_sped:
         if "|I250|" in line:
@@ -62,7 +59,7 @@ if file_sped and df_novo is not None:
             if len(reg) > 2:
                 contas_com_movimento.add(reg[2].strip())
 
-    # PASSO 2: Mapear essas contas no I050
+    # PASSO 2: Mapear no I050 de forma dinâmica
     contas_origem_data = []
     for line in content_sped:
         if "|I050|" in line:
@@ -119,43 +116,40 @@ if file_sped and df_novo is not None:
                     escolha = st.selectbox(f"sel_{row['cod']}", options=opcoes, index=idx_padrao, key=f"sel_{row['cod']}", label_visibility="collapsed")
                     
                     if escolha == "📝 -- DIGITAR MANUALMENTE --":
-                        cod_manual = st.text_input(f"Digite o CÓD. REDUZIDO para {row['cod']}:", key=f"in_{row['cod']}")
+                        cod_manual = st.text_input(f"Digite o CÓD. REDUZIDO:", key=f"in_{row['cod']}")
                         if cod_manual: de_para_map[row['cod']] = str(cod_manual)
                     elif escolha != "-- SELECIONE --":
-                        # Resgata o valor da Coluna A (Código Reduzido)
-                        cod_reduzido_novo = df_busca[df_busca['Display'] == escolha].iloc[0]['Código']
-                        de_para_map[row['cod']] = str(cod_reduzido_novo)
+                        de_para_map[row['cod']] = df_busca[df_busca['Display'] == escolha].iloc[0]['Código']
                 st.markdown("---")
 
-        # --- RESUMO E FINALIZAÇÃO ---
+        # --- RESUMO COM PERCENTUAIS ---
         st.divider()
-        total_contas = len(df_origem)
+        total = len(df_origem)
         mapeadas = len(de_para_map)
-        pendentes = total_contas - mapeadas
+        pendentes = total - mapeadas
+        perc_concluido = (mapeadas / total) * 100 if total > 0 else 0
 
-        col_res1, col_res2, col_res3 = st.columns(3)
-        col_res1.metric("Contas Detectadas", total_contas)
-        col_res2.metric("Mapeadas", mapeadas)
-        col_res3.metric("Pendentes", pendentes)
+        col_m1, col_m2, col_m3 = st.columns(3)
+        col_m1.metric("Total de Contas", total)
+        col_m2.metric("Mapeadas", mapeadas, f"{perc_concluido:.1f}%")
+        col_m3.metric("Pendentes", pendentes, f"-{pendentes}", delta_color="inverse")
 
         if pendentes > 0:
-            st.warning(f"⚠️ Mapeie todas as contas para liberar o download.")
+            st.warning(f"⚠️ Conclua o mapeamento das {pendentes} contas restantes.")
         
-        if st.button("🚀 Gerar SPED com Códigos Reduzidos", disabled=(pendentes > 0), use_container_width=True):
+        if st.button("🚀 Gerar Novo SPED", disabled=(pendentes > 0), use_container_width=True):
             saida = []
             for line in content_sped:
                 if "|I250|" in line:
                     reg = line.split("|")
                     if len(reg) > 2 and reg[2] in de_para_map:
-                        # Substitui pelo código reduzido mapeado
                         reg[2] = de_para_map[reg[2]]
                     saida.append("|".join(reg))
                 else:
                     saida.append(line)
-            
-            st.success("SPED Ajustado com Sucesso!")
-            st.download_button("💾 Baixar Arquivo", "\n".join(saida), "SPED_REDUZIDO_AJUSTADO.txt", use_container_width=True)
+            st.success("SPED gerado com sucesso!")
+            st.download_button("💾 Baixar Arquivo", "\n".join(saida), "SPED_FINAL.txt", use_container_width=True)
     else:
-        st.error("Nenhum lançamento vinculado ao plano de contas foi encontrado.")
+        st.error("Nenhuma conta com movimento foi detectada.")
 else:
     st.info("Aguardando arquivos...")
