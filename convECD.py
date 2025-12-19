@@ -8,12 +8,12 @@ st.set_page_config(page_title="DE/PARA SPED ECD", layout="wide")
 st.markdown("<style>.cont-row {border-bottom: 1px solid #f0f2f6; padding: 15px 0px;}</style>", unsafe_allow_html=True)
 
 st.title("🛠️ Conversor de Lançamentos ECD")
-st.info("Foco: Substituição pelo **Código Reduzido** com indicadores de progresso.")
+st.info("Versão 1.0 Beta")
 
 # --- SIDEBAR ---
 st.sidebar.header("Configurações")
 file_sped = st.sidebar.file_uploader("1. Arquivo SPED (TXT)", type=["txt"])
-usar_padrao = st.sidebar.checkbox("Usar Plano de Contas Padrão?", value=True)
+usar_padrao = st.sidebar.checkbox("Usar Plano de Contas Padrão UNSAO?", value=True)
 
 # FILTRO DE VISUALIZAÇÃO
 st.sidebar.divider()
