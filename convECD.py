@@ -137,17 +137,17 @@ if file_sped and df_novo is not None:
                     
                     opcoes = ["-- SELECIONE --", "📝 -- DIGITAR MANUALMENTE --"] + df_busca['Display'].tolist()
                     
-                    # Recuperação de índice e exibição de similaridade
+                    # Logica de cores e recuperação de estado
                     idx_padrao = 0
                     if foi_mapeada:
                         valor_mapeado = st.session_state.de_para_map[cod_atual]
                         try:
                             display_gravado = df_busca[df_busca['Código'] == valor_mapeado].iloc[0]['Display']
                             idx_padrao = opcoes.index(display_gravado)
-                            st.caption(f"📌 Mapeado (Score original: {score}%)")
+                            st.success(f"📌 Mapeado (Score original: {score}%)")
                         except:
                             idx_padrao = 1
-                            st.caption(f"📝 Digitado Manualmente")
+                            st.info(f"📝 Digitado Manualmente")
                     else:
                         if score >= 70:
                             sugestao_full = df_busca[df_busca['Nome'] == match_nome].iloc[0]['Display']
