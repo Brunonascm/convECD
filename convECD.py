@@ -8,12 +8,20 @@ st.set_page_config(page_title="DE/PARA SPED ECD", layout="wide")
 st.markdown("<style>.cont-row {border-bottom: 1px solid #f0f2f6; padding: 15px 0px;}</style>", unsafe_allow_html=True)
 
 st.title("🛠️ Conversor de Lançamentos ECD")
-st.info("Versão 1.0")
+st.info("Versão 1.0 Beta")
 
 # --- SIDEBAR ---
 st.sidebar.header("Configurações")
 file_sped = st.sidebar.file_uploader("1. Arquivo SPED (TXT)", type=["txt"])
 usar_padrao = st.sidebar.checkbox("Usar Plano de Contas Padrão UNSAO?", value=True)
+
+# FILTRO DE VISUALIZAÇÃO
+st.sidebar.divider()
+st.sidebar.header("Filtros de Tela")
+filtro_status = st.sidebar.selectbox(
+    "Mostrar na lista:",
+    ["Todas", "Apenas Pendentes", "Apenas Mapeadas"]
+)
 
 df_novo = None
 if usar_padrao:
@@ -29,7 +37,6 @@ if usar_padrao:
 else:
     file_excel = st.sidebar.file_uploader("2. Subir Novo Plano (Excel)", type=["xlsx"])
     
-    # --- CAMPO DE INFORMAÇÕES DO LEIAUTE ---
     with st.sidebar.expander("ℹ️ Informações de Leiaute"):
         st.markdown("""
         O arquivo Excel deve estar na seguinte ordem **sem cabeçalho**:
@@ -61,7 +68,6 @@ if file_sped and df_novo is not None:
 
     content_sped = ler_arquivo_texto(file_sped)
     
-    # PASSO 1: Identificar movimento no I250
     contas_com_movimento = set()
     for line in content_sped:
         if "|I250|" in line:
@@ -69,7 +75,6 @@ if file_sped and df_novo is not None:
             if len(reg) > 2:
                 contas_com_movimento.add(reg[2].strip())
 
-    # PASSO 2: Mapear no I050 de forma dinâmica
     contas_origem_data = []
     for line in content_sped:
         if "|I050|" in line:
@@ -101,9 +106,22 @@ if file_sped and df_novo is not None:
 
     if not df_origem.empty:
         st.subheader("🔗 Mapeamento de Contas")
-        de_para_map = {}
+        
+        # Inicializa o dicionário de mapeamento no estado da sessão para persistir entre filtros
+        if 'de_para_map' not in st.session_state:
+            st.session_state.de_para_map = {}
 
+        # Interface de Mapeamento
         for idx, row in df_origem.iterrows():
+            cod_atual = row['cod']
+            foi_mapeada = cod_atual in st.session_state.de_para_map
+
+            # LÓGICA DO FILTRO DE TELA
+            if filtro_status == "Apenas Pendentes" and foi_mapeada:
+                continue
+            if filtro_status == "Apenas Mapeadas" and not foi_mapeada:
+                continue
+
             with st.container():
                 col_origem, col_destino = st.columns([1, 1])
                 grupo_atual = row['grupo']
@@ -112,7 +130,7 @@ if file_sped and df_novo is not None:
                 
                 with col_origem:
                     st.markdown(f"**{row['nome']}**")
-                    st.caption(f"Cod no SPED: {row['cod']} | Grupo: {grupo_atual}")
+                    st.caption(f"Cod no SPED: {cod_atual} | Grupo: {grupo_atual}")
                 
                 with col_destino:
                     lista_nomes = df_busca['Nome'].tolist()
@@ -120,22 +138,43 @@ if file_sped and df_novo is not None:
                     match_nome, score = res_fuzz[0], res_fuzz[1]
                     
                     opcoes = ["-- SELECIONE --", "📝 -- DIGITAR MANUALMENTE --"] + df_busca['Display'].tolist()
-                    idx_padrao = opcoes.index(df_busca[df_busca['Nome'] == match_nome].iloc[0]['Display']) if score >= 70 else 0
                     
-                    st.caption(f"✅ Sugestão: {score}%" if score >= 70 else "⚠️ Similaridade baixa")
-                    escolha = st.selectbox(f"sel_{row['cod']}", options=opcoes, index=idx_padrao, key=f"sel_{row['cod']}", label_visibility="collapsed")
+                    # Tenta recuperar o que já foi selecionado para não perder ao filtrar
+                    idx_padrao = 0
+                    if foi_mapeada:
+                        # Se já mapeamos, tentamos achar o índice do valor no display
+                        valor_mapeado = st.session_state.de_para_map[cod_atual]
+                        # Tenta achar o display que corresponde ao código reduzido mapeado
+                        try:
+                            display_gravado = df_busca[df_busca['Código'] == valor_mapeado].iloc[0]['Display']
+                            idx_padrao = opcoes.index(display_gravado)
+                        except:
+                            idx_padrao = 1 # Cai no manual se não achar na lista
+                    elif score >= 70:
+                        sugestao_full = df_busca[df_busca['Nome'] == match_nome].iloc[0]['Display']
+                        idx_padrao = opcoes.index(sugestao_full)
+                        st.caption(f"✅ Sugestão: {score}%")
+                    
+                    escolha = st.selectbox(f"sel_{cod_atual}", options=opcoes, index=idx_padrao, key=f"sel_{cod_atual}", label_visibility="collapsed")
                     
                     if escolha == "📝 -- DIGITAR MANUALMENTE --":
-                        cod_manual = st.text_input(f"Digite o CÓD. REDUZIDO:", key=f"in_{row['cod']}")
-                        if cod_manual: de_para_map[row['cod']] = str(cod_manual)
+                        valor_anterior = st.session_state.de_para_map.get(cod_atual, "")
+                        cod_manual = st.text_input(f"Cód. manual para {cod_atual}:", value=valor_anterior, key=f"in_{cod_atual}")
+                        if cod_manual: 
+                            st.session_state.de_para_map[cod_atual] = str(cod_manual)
                     elif escolha != "-- SELECIONE --":
-                        de_para_map[row['cod']] = df_busca[df_busca['Display'] == escolha].iloc[0]['Código']
+                        cod_reduzido = df_busca[df_busca['Display'] == escolha].iloc[0]['Código']
+                        st.session_state.de_para_map[cod_atual] = str(cod_reduzido)
+                    else:
+                        # Se voltar para "Selecione", remove do mapa
+                        if cod_atual in st.session_state.de_para_map:
+                            del st.session_state.de_para_map[cod_atual]
                 st.markdown("---")
 
         # --- RESUMO COM PERCENTUAIS ---
         st.divider()
         total = len(df_origem)
-        mapeadas = len(de_para_map)
+        mapeadas = len(st.session_state.de_para_map)
         pendentes = total - mapeadas
         perc_concluido = (mapeadas / total) * 100 if total > 0 else 0
 
@@ -145,21 +184,21 @@ if file_sped and df_novo is not None:
         col_m3.metric("Pendentes", pendentes, f"-{pendentes}", delta_color="inverse")
 
         if pendentes > 0:
-            st.warning(f"⚠️ Conclua o mapeamento das {pendentes} contas restantes.")
+            st.warning(f"⚠️ Existem {pendentes} contas pendentes. Mude o filtro para 'Apenas Pendentes' para agilizar.")
         
         if st.button("🚀 Gerar Novo SPED", disabled=(pendentes > 0), use_container_width=True):
             saida = []
             for line in content_sped:
                 if "|I250|" in line:
                     reg = line.split("|")
-                    if len(reg) > 2 and reg[2] in de_para_map:
-                        reg[2] = de_para_map[reg[2]]
+                    if len(reg) > 2 and reg[2] in st.session_state.de_para_map:
+                        reg[2] = st.session_state.de_para_map[reg[2]]
                     saida.append("|".join(reg))
                 else:
                     saida.append(line)
             st.success("SPED gerado com sucesso!")
             st.download_button("💾 Baixar Arquivo", "\n".join(saida), "SPED_FINAL.txt", use_container_width=True)
     else:
-        st.error("Nenhuma conta com movimento foi detectada.")
+        st.error("Nenhuma conta com movimento detectada.")
 else:
     st.info("Aguardando arquivos...")
