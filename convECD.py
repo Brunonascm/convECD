@@ -25,6 +25,15 @@ def atualizar_manual(cod_conta):
         if valor:
             st.session_state.de_para_map[str(cod_conta)] = str(valor)
 
+def atualizar_dropdown(cod_conta, chave_select):
+    valor = st.session_state[chave_select]
+    if valor and valor != "-- SELECIONE --" and "📝" not in valor:
+        cod_reduzido = valor.split(" | ")[0]
+        st.session_state.de_para_map[str(cod_conta)] = str(cod_reduzido)
+    elif valor == "-- SELECIONE --":
+        if str(cod_conta) in st.session_state.de_para_map:
+            del st.session_state.de_para_map[str(cod_conta)]
+
 # --- SIDEBAR ---
 st.sidebar.header("Configurações")
 file_sped = st.sidebar.file_uploader("1. Arquivo SPED (TXT)", type=["txt"])
@@ -93,7 +102,7 @@ ocultar_mapeadas = st.sidebar.checkbox("Ocultar contas já mapeadas?", value=Fal
 
 def ler_arquivo_texto(file):
     raw_data = file.getvalue()
-    # Tenta decode com latin-1 primeiro (Padrão SPED), fallback para utf-8
+    # Tenta decodificar com latin-1 (padrão SPED) e fallback para outros
     encodings = ["latin-1", "cp1252", "utf-8"]
     content = None
     for encoding in encodings:
@@ -104,7 +113,6 @@ def ler_arquivo_texto(file):
             continue
     
     if content is None:
-        # Se tudo falhar, força latin-1 ignorando erros para não travar
         content = raw_data.decode("latin-1", errors="ignore")
         
     return [linha.strip('\r\n') for linha in content.splitlines() if linha.strip()]
@@ -119,6 +127,7 @@ if file_sped and df_novo is not None:
     
     contas_com_movimento = set()
     for line in content_sped:
+        # Detecta I250 independente da assinatura no final
         if line.startswith("|I250|"):
             reg = line.split("|")
             if len(reg) > 2: contas_com_movimento.add(reg[2].strip())
@@ -138,7 +147,6 @@ if file_sped and df_novo is not None:
                 if cod_encontrado:
                     nome_conta = "Sem Nome"
                     for j in range(pos_classif + 1, len(reg)):
-                        # Melhora na detecção do nome para evitar pegar campos vazios
                         if len(reg[j].strip()) > 2 and not reg[j].replace(".","").isnumeric():
                             nome_conta = reg[j].strip()
                             break
@@ -324,26 +332,27 @@ if file_sped and df_novo is not None:
             
             if st.button("🚀 Gerar SPED", disabled=(pendentes > 0), use_container_width=True):
                 saida = []
-                # CODIFICAÇÃO LATIN-1 NA SAÍDA PARA EVITAR ERROS NO SPED
+                # --- CORREÇÃO DO LIXO NO FINAL ---
                 for line in content_sped:
+                    # Se encontrarmos o encerramento do arquivo, paramos de ler
+                    # Isso evita copiar a assinatura digital binária do arquivo antigo
+                    if line.startswith("|9999|"):
+                        saida.append(line)
+                        break
+                        
                     if line.startswith("|I250|"):
                         reg = line.split("|")
-                        # Verifica integridade básica e se a conta precisa de troca
                         if len(reg) > 2 and reg[2] in map_final_para_geracao:
-                            # Sanitização: Remove espaços e pipes do novo código para não quebrar colunas
-                            novo_codigo = str(map_final_para_geracao[reg[2]]).strip().replace("|", "")
-                            reg[2] = novo_codigo
-                        
-                        # Reconstrói a linha preservando todos os campos (incluindo histórico no índice 8)
+                            # Sanitização para evitar quebra de layout
+                            novo_cod = str(map_final_para_geracao[reg[2]]).strip().replace("|", "")
+                            reg[2] = novo_cod
                         saida.append("|".join(reg))
                     else:
                         saida.append(line)
                 
-                # Encode final para bytes latin-1
-                output_str = "\r\n".join(saida)
-                output_bytes = output_str.encode("latin-1", errors="replace")
-                
-                st.download_button("💾 Baixar TXT", output_bytes, "SPED_AJUSTADO.txt", "text/plain", use_container_width=True)
+                # Força encoding Latin-1 para preservar acentos e padrão SPED
+                output_data = "\r\n".join(saida).encode("latin-1", errors="replace")
+                st.download_button("💾 Baixar TXT", output_data, "SPED_AJUSTADO.txt", "text/plain", use_container_width=True)
 
         with col2:
             st.markdown("**2. Balanço (I155)**")
