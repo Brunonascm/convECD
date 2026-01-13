@@ -84,25 +84,30 @@ if arquivo_backup is not None:
     except Exception as e:
         st.sidebar.error(f"Erro no backup: {e}")
 
-# Placeholder para o botão de salvar aparecer aqui visualmente
 placeholder_botao_salvar = st.sidebar.empty()
 
-# --- NOVO SISTEMA DE FILTROS (CHECKBOX) ---
+# --- FILTROS DE TELA ---
 st.sidebar.divider()
 st.sidebar.header("Filtros de Tela")
-# O padrão é False (Não ocultar), assim o usuário vê o que acabou de fazer
 ocultar_mapeadas = st.sidebar.checkbox("Ocultar contas já mapeadas?", value=False)
 
 def ler_arquivo_texto(file):
     raw_data = file.getvalue()
-    content = raw_data
-    for encoding in ["cp1252", "utf-8", "latin-1"]:
+    # Tenta decode com latin-1 primeiro (Padrão SPED), fallback para utf-8
+    encodings = ["latin-1", "cp1252", "utf-8"]
+    content = None
+    for encoding in encodings:
         try:
             content = raw_data.decode(encoding)
             break
-        except UnicodeError: continue
-    if isinstance(content, bytes): content = content.decode("latin-1")
-    return [linha.strip() for linha in content.splitlines() if linha.strip()]
+        except UnicodeError:
+            continue
+    
+    if content is None:
+        # Se tudo falhar, força latin-1 ignorando erros para não travar
+        content = raw_data.decode("latin-1", errors="ignore")
+        
+    return [linha.strip('\r\n') for linha in content.splitlines() if linha.strip()]
 
 # --- Lógica Principal ---
 if file_sped and df_novo is not None:
@@ -114,13 +119,13 @@ if file_sped and df_novo is not None:
     
     contas_com_movimento = set()
     for line in content_sped:
-        if "|I250|" in line:
+        if line.startswith("|I250|"):
             reg = line.split("|")
             if len(reg) > 2: contas_com_movimento.add(reg[2].strip())
 
     contas_origem_data = []
     for line in content_sped:
-        if "|I050|" in line:
+        if line.startswith("|I050|"):
             reg = line.split("|")
             if len(reg) > 6:
                 cod_encontrado = None
@@ -133,7 +138,8 @@ if file_sped and df_novo is not None:
                 if cod_encontrado:
                     nome_conta = "Sem Nome"
                     for j in range(pos_classif + 1, len(reg)):
-                        if len(reg[j]) > 3 and not reg[j].replace(".","").isnumeric():
+                        # Melhora na detecção do nome para evitar pegar campos vazios
+                        if len(reg[j].strip()) > 2 and not reg[j].replace(".","").isnumeric():
                             nome_conta = reg[j].strip()
                             break
                     contas_origem_data.append({
@@ -218,8 +224,6 @@ if file_sped and df_novo is not None:
             resolvida = item['resolvida']
             esta_no_mapa = item['esta_no_mapa']
             
-            # --- FILTRO SIMPLIFICADO ---
-            # Se o usuário marcou o checkbox "Ocultar", pulamos as resolvidas.
             if ocultar_mapeadas and resolvida:
                 continue
 
@@ -254,7 +258,6 @@ if file_sped and df_novo is not None:
                     if chave_select not in st.session_state:
                         st.session_state[chave_select] = valor_inicial
 
-                    # Status Visual
                     if item['is_manual']:
                         st.info("📌 Mapeado Manualmente")
                     elif item['score'] >= 65:
@@ -262,7 +265,6 @@ if file_sped and df_novo is not None:
                     else:
                         st.warning(f"⚠️ Similaridade baixa ({item['score']}%)")
 
-                    # Selectbox (Sem callback complexo para evitar conflito com filtro)
                     escolha = st.selectbox(
                         label=f"sel_{cod_atual}", 
                         options=opcoes, 
@@ -270,15 +272,12 @@ if file_sped and df_novo is not None:
                         label_visibility="collapsed"
                     )
 
-                    # Lógica de Salvamento Direta
                     novo_valor = None
-                    
                     if escolha == "📝 -- DIGITAR MANUALMENTE --":
                         pass
                     elif escolha != "-- SELECIONE --":
                         try:
                             cod_reduzido = df_busca[df_busca['Display'] == escolha].iloc[0]['Código']
-                            # Só salva se mudou
                             if str(cod_reduzido) != item['valor_no_mapa']:
                                 novo_valor = str(cod_reduzido)
                         except: pass
@@ -290,7 +289,6 @@ if file_sped and df_novo is not None:
                         st.session_state.de_para_map[cod_atual] = novo_valor
                         st.rerun()
 
-                    # Input Manual
                     if escolha == "📝 -- DIGITAR MANUALMENTE --":
                         valor_ant = st.session_state.de_para_map.get(cod_atual, "")
                         st.text_input(
@@ -326,18 +324,29 @@ if file_sped and df_novo is not None:
             
             if st.button("🚀 Gerar SPED", disabled=(pendentes > 0), use_container_width=True):
                 saida = []
+                # CODIFICAÇÃO LATIN-1 NA SAÍDA PARA EVITAR ERROS NO SPED
                 for line in content_sped:
-                    if "|I250|" in line:
+                    if line.startswith("|I250|"):
                         reg = line.split("|")
+                        # Verifica integridade básica e se a conta precisa de troca
                         if len(reg) > 2 and reg[2] in map_final_para_geracao:
-                            reg[2] = map_final_para_geracao[reg[2]]
+                            # Sanitização: Remove espaços e pipes do novo código para não quebrar colunas
+                            novo_codigo = str(map_final_para_geracao[reg[2]]).strip().replace("|", "")
+                            reg[2] = novo_codigo
+                        
+                        # Reconstrói a linha preservando todos os campos (incluindo histórico no índice 8)
                         saida.append("|".join(reg))
                     else:
                         saida.append(line)
-                st.download_button("💾 Baixar TXT", "\n".join(saida), "SPED_AJUSTADO.txt", use_container_width=True)
+                
+                # Encode final para bytes latin-1
+                output_str = "\r\n".join(saida)
+                output_bytes = output_str.encode("latin-1", errors="replace")
+                
+                st.download_button("💾 Baixar TXT", output_bytes, "SPED_AJUSTADO.txt", "text/plain", use_container_width=True)
 
         with col2:
-            st.markdown("**2. Balanço de abertura (I155)**")
+            st.markdown("**2. Balanço (I155)**")
             data_balanco = st.date_input("Data:", datetime.today(), format="DD/MM/YYYY")
             if st.button("📊 Gerar Balanço", disabled=(pendentes > 0), use_container_width=True):
                 dt_fmt = data_balanco.strftime("%d/%m/%Y")
@@ -345,18 +354,20 @@ if file_sped and df_novo is not None:
                 rtl_count = 0
                 linhas = 0
                 for line in content_sped:
-                    if "|I150|" in line: rtl_count += 1
-                    if rtl_count == 1 and "|I155|" in line:
+                    if line.startswith("|I150|"): rtl_count += 1
+                    if rtl_count == 1 and line.startswith("|I155|"):
                         reg = line.split("|")
                         if len(reg) > 5:
                             cod = reg[2].strip()
                             if cod in map_final_para_geracao:
-                                novo = map_final_para_geracao[cod]
+                                novo = map_final_para_geracao[cod].replace("|", "")
                                 hist = f"SALDO DE ABERTURA EM {dt_fmt}"
                                 linha = f"|6100|{dt_fmt}|{novo}||{reg[4]}||{hist}||||||" if reg[5]=='D' else f"|6100|{dt_fmt}||{novo}|{reg[4]}||{hist}||||||"
                                 saida_balanco.append(linha)
                                 linhas += 1
-                if linhas > 0: st.download_button("💾 Baixar Balanço", "\n".join(saida_balanco), f"BALANCO_{dt_fmt.replace('/','')}.txt", use_container_width=True)
+                
+                output_balanco = "\r\n".join(saida_balanco).encode("latin-1", errors="replace")
+                if linhas > 0: st.download_button("💾 Baixar Balanço", output_balanco, f"BALANCO_{dt_fmt.replace('/','')}.txt", "text/plain", use_container_width=True)
                 else: st.warning("Sem dados.")
 
         with col3:
@@ -371,7 +382,7 @@ if file_sped and df_novo is not None:
             st.markdown("**4. Configuração**")
             if os.path.exists("Conjunto SPED.xml"):
                 with open("Conjunto SPED.xml", "rb") as f:
-                    st.download_button("⬇️ Conjunto de Dados", f.read(), "Conjunto SPED.xml", "application/xml", use_container_width=True)
+                    st.download_button("⬇️ Baixar XML", f.read(), "Conjunto SPED.xml", "application/xml", use_container_width=True)
             else: st.info("XML indisponível.")
 
     else:
