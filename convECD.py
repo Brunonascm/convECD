@@ -100,21 +100,15 @@ st.sidebar.divider()
 st.sidebar.header("Filtros de Tela")
 ocultar_mapeadas = st.sidebar.checkbox("Ocultar contas já mapeadas?", value=False)
 
-def ler_arquivo_texto(file):
+def ler_arquivo_texto_seguro(file):
     raw_data = file.getvalue()
-    # Tenta decodificar com latin-1 (padrão SPED) e fallback para outros
-    encodings = ["latin-1", "cp1252", "utf-8"]
-    content = None
-    for encoding in encodings:
-        try:
-            content = raw_data.decode(encoding)
-            break
-        except UnicodeError:
-            continue
+    # Força Latin-1 (Padrão SPED) para garantir acentos corretos no histórico
+    try:
+        content = raw_data.decode("latin-1")
+    except UnicodeError:
+        # Fallback se falhar
+        content = raw_data.decode("cp1252", errors="ignore")
     
-    if content is None:
-        content = raw_data.decode("latin-1", errors="ignore")
-        
     return [linha.strip('\r\n') for linha in content.splitlines() if linha.strip()]
 
 # --- Lógica Principal ---
@@ -123,11 +117,10 @@ if file_sped and df_novo is not None:
     df_novo['Display'] = df_novo['Código'] + " | " + df_novo['Classificação'] + " - " + df_novo['Nome']
     df_novo['Grupo'] = df_novo['Classificação'].str[0]
 
-    content_sped = ler_arquivo_texto(file_sped)
+    content_sped = ler_arquivo_texto_seguro(file_sped)
     
     contas_com_movimento = set()
     for line in content_sped:
-        # Detecta I250 independente da assinatura no final
         if line.startswith("|I250|"):
             reg = line.split("|")
             if len(reg) > 2: contas_com_movimento.add(reg[2].strip())
@@ -332,10 +325,9 @@ if file_sped and df_novo is not None:
             
             if st.button("🚀 Gerar SPED", disabled=(pendentes > 0), use_container_width=True):
                 saida = []
-                # --- CORREÇÃO DO LIXO NO FINAL ---
                 for line in content_sped:
-                    # Se encontrarmos o encerramento do arquivo, paramos de ler
-                    # Isso evita copiar a assinatura digital binária do arquivo antigo
+                    # REMOÇÃO CIRÚRGICA DA ASSINATURA/LIXO
+                    # Se encontrarmos o registro 9999, adicionamos ele e PARAMOS de ler.
                     if line.startswith("|9999|"):
                         saida.append(line)
                         break
@@ -343,14 +335,14 @@ if file_sped and df_novo is not None:
                     if line.startswith("|I250|"):
                         reg = line.split("|")
                         if len(reg) > 2 and reg[2] in map_final_para_geracao:
-                            # Sanitização para evitar quebra de layout
+                            # Sanitização
                             novo_cod = str(map_final_para_geracao[reg[2]]).strip().replace("|", "")
                             reg[2] = novo_cod
                         saida.append("|".join(reg))
                     else:
                         saida.append(line)
                 
-                # Força encoding Latin-1 para preservar acentos e padrão SPED
+                # ENCODING LATIN-1 OBRIGATÓRIO NA SAÍDA (Preserva Histórico)
                 output_data = "\r\n".join(saida).encode("latin-1", errors="replace")
                 st.download_button("💾 Baixar TXT", output_data, "SPED_AJUSTADO.txt", "text/plain", use_container_width=True)
 
