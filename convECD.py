@@ -4,7 +4,8 @@ from thefuzz import process, fuzz
 import os
 import io
 import json
-from datetime import datetime
+import re
+from datetime import datetime, timedelta
 
 st.set_page_config(page_title="DE/PARA SPED ECD", layout="wide")
 
@@ -17,7 +18,17 @@ st.info("Foco: Substituição pelo **Código Reduzido** com indicadores de progr
 if 'de_para_map' not in st.session_state:
     st.session_state.de_para_map = {}
 
-# --- CALLBACKS ---
+if 'balanco_processado' not in st.session_state:
+    st.session_state.balanco_processado = False
+    st.session_state.balanco_dados = None
+    st.session_state.balanco_totais = {}
+
+# --- FUNÇÕES AUXILIARES ---
+def limpar_nome_arquivo(nome):
+    """Remove caracteres inválidos para nome de arquivo"""
+    nome_limpo = re.sub(r'[\\/*?:"<>|]', "", nome)
+    return nome_limpo.strip()
+
 def atualizar_manual(cod_conta):
     chave_input = f"in_{cod_conta}"
     if chave_input in st.session_state:
@@ -34,10 +45,21 @@ def atualizar_dropdown(cod_conta, chave_select):
         if str(cod_conta) in st.session_state.de_para_map:
             del st.session_state.de_para_map[str(cod_conta)]
 
+def format_moeda(valor):
+    return f"R$ {valor:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+def ler_arquivo_texto_seguro(file):
+    raw_data = file.getvalue()
+    try:
+        content = raw_data.decode("latin-1")
+    except UnicodeError:
+        content = raw_data.decode("cp1252", errors="ignore")
+    return [linha.strip('\r\n') for linha in content.splitlines() if linha.strip()]
+
 # --- SIDEBAR ---
 st.sidebar.header("Configurações")
 file_sped = st.sidebar.file_uploader("1. Arquivo SPED (TXT)", type=["txt"])
-usar_padrao = st.sidebar.checkbox("Usar Plano de Contas Padrão?", value=True)
+usar_padrao = st.sidebar.checkbox("Usar Plano de Contas Padrão UNSAO?", value=True)
 
 # --- CARREGAMENTO DO PLANO ---
 df_novo = None
@@ -100,17 +122,6 @@ st.sidebar.divider()
 st.sidebar.header("Filtros de Tela")
 ocultar_mapeadas = st.sidebar.checkbox("Ocultar contas já mapeadas?", value=False)
 
-def ler_arquivo_texto_seguro(file):
-    raw_data = file.getvalue()
-    # Força Latin-1 (Padrão SPED) para garantir acentos corretos no histórico
-    try:
-        content = raw_data.decode("latin-1")
-    except UnicodeError:
-        # Fallback se falhar
-        content = raw_data.decode("cp1252", errors="ignore")
-    
-    return [linha.strip('\r\n') for linha in content.splitlines() if linha.strip()]
-
 # --- Lógica Principal ---
 if file_sped and df_novo is not None:
     df_novo = df_novo.astype(str)
@@ -119,6 +130,27 @@ if file_sped and df_novo is not None:
 
     content_sped = ler_arquivo_texto_seguro(file_sped)
     
+    # --- EXTRAÇÃO DE DADOS DO CABEÇALHO (REGISTRO 0000) ---
+    nome_empresa = "EMPRESA"
+    dt_inicial_sped = None
+    
+    for line in content_sped:
+        if line.startswith("|0000|"):
+            parts = line.split("|")
+            # CORREÇÃO DE ÍNDICES:
+            # 0:'' | 1:'0000' | 2:'LECD' | 3:'DT_INI' | 4:'DT_FIN' | 5:'NOME'
+            
+            if len(parts) > 5:
+                nome_empresa = limpar_nome_arquivo(parts[5])
+            
+            if len(parts) > 3:
+                try:
+                    dt_str = parts[3] # Data Inicial está no índice 3
+                    dt_inicial_sped = datetime.strptime(dt_str, "%d%m%Y").date()
+                except:
+                    pass
+            break
+            
     contas_com_movimento = set()
     for line in content_sped:
         if line.startswith("|I250|"):
@@ -154,7 +186,7 @@ if file_sped and df_novo is not None:
 
     if not df_origem.empty:
         
-        # --- CÁLCULOS ---
+        # --- CÁLCULOS PRINCIPAIS ---
         total_mapeadas_count = 0
         map_final_para_geracao = st.session_state.de_para_map.copy()
         process_data = []
@@ -319,57 +351,115 @@ if file_sped and df_novo is not None:
         
         col1, col2, col3, col4 = st.columns(4)
 
+        # 1. SPED AJUSTADO
+        sped_buffer = None
+        if pendentes == 0:
+            saida = []
+            for line in content_sped:
+                if line.startswith("|9999|"):
+                    saida.append(line)
+                    break
+                if line.startswith("|I250|"):
+                    reg = line.split("|")
+                    if len(reg) > 2 and reg[2] in map_final_para_geracao:
+                        novo_cod = str(map_final_para_geracao[reg[2]]).strip().replace("|", "")
+                        reg[2] = novo_cod
+                    saida.append("|".join(reg))
+                else:
+                    saida.append(line)
+            sped_buffer = "\r\n".join(saida).encode("latin-1", errors="replace")
+
         with col1:
             st.markdown("**1. Arquivo Final**")
-            if pendentes > 0: st.warning(f"⚠️ Faltam {pendentes}.")
-            
-            if st.button("🚀 Gerar SPED", disabled=(pendentes > 0), use_container_width=True):
-                saida = []
-                for line in content_sped:
-                    # REMOÇÃO CIRÚRGICA DA ASSINATURA/LIXO
-                    # Se encontrarmos o registro 9999, adicionamos ele e PARAMOS de ler.
-                    if line.startswith("|9999|"):
-                        saida.append(line)
-                        break
-                        
-                    if line.startswith("|I250|"):
-                        reg = line.split("|")
-                        if len(reg) > 2 and reg[2] in map_final_para_geracao:
-                            # Sanitização
-                            novo_cod = str(map_final_para_geracao[reg[2]]).strip().replace("|", "")
-                            reg[2] = novo_cod
-                        saida.append("|".join(reg))
-                    else:
-                        saida.append(line)
-                
-                # ENCODING LATIN-1 OBRIGATÓRIO NA SAÍDA (Preserva Histórico)
-                output_data = "\r\n".join(saida).encode("latin-1", errors="replace")
-                st.download_button("💾 Baixar TXT", output_data, "SPED_AJUSTADO.txt", "text/plain", use_container_width=True)
+            if pendentes > 0: 
+                st.warning(f"⚠️ Faltam {pendentes}.")
+                st.button("🚀 Gerar SPED", disabled=True) 
+            else:
+                st.download_button(
+                    "💾 Baixar SPED Ajustado", 
+                    data=sped_buffer, 
+                    file_name=f"SPED_AJUSTADO_{nome_empresa}.txt", 
+                    mime="text/plain", 
+                    use_container_width=True
+                )
 
+        # 2. BALANÇO
         with col2:
-            st.markdown("**2. Balanço (I155)**")
-            data_balanco = st.date_input("Data:", datetime.today(), format="DD/MM/YYYY")
-            if st.button("📊 Gerar Balanço", disabled=(pendentes > 0), use_container_width=True):
-                dt_fmt = data_balanco.strftime("%d/%m/%Y")
-                saida_balanco = ["|6000|V||||"]
+            st.markdown("**2. Balanço de Abertura (I155)**")
+            
+            # --- LÓGICA DE DATA PADRÃO (CORRIGIDA) ---
+            data_padrao = datetime.today()
+            if dt_inicial_sped:
+                data_padrao = dt_inicial_sped - timedelta(days=1)
+                
+            data_balanco = st.date_input("Data p/ Balanço:", data_padrao, format="DD/MM/YYYY")
+            dt_fmt = data_balanco.strftime("%d/%m/%Y")
+            
+            if st.button("🔍 Processar e Conferir"):
+                balanco_lines = ["|6000|V||||"]
                 rtl_count = 0
-                linhas = 0
+                has_balanco = False
+                total_debito = 0.0
+                total_credito = 0.0
+                
                 for line in content_sped:
                     if line.startswith("|I150|"): rtl_count += 1
+                    
                     if rtl_count == 1 and line.startswith("|I155|"):
                         reg = line.split("|")
                         if len(reg) > 5:
                             cod = reg[2].strip()
-                            if cod in map_final_para_geracao:
+                            val_str = reg[4].strip()
+                            dc = reg[5].strip()
+                            
+                            try:
+                                val_float = float(val_str.replace(",", "."))
+                            except:
+                                val_float = 0.0
+                                
+                            if cod in map_final_para_geracao and val_float > 0:
                                 novo = map_final_para_geracao[cod].replace("|", "")
-                                hist = f"SALDO DE ABERTURA EM {dt_fmt}"
-                                linha = f"|6100|{dt_fmt}|{novo}||{reg[4]}||{hist}||||||" if reg[5]=='D' else f"|6100|{dt_fmt}||{novo}|{reg[4]}||{hist}||||||"
-                                saida_balanco.append(linha)
-                                linhas += 1
+                                
+                                if dc == 'D': total_debito += val_float
+                                else: total_credito += val_float
+                                
+                                if dc == 'D':
+                                    linha = f"|6100|{dt_fmt}|{novo}||{val_str}||SALDO DE ABERTURA EM {dt_fmt}|||||"
+                                else:
+                                    linha = f"|6100|{dt_fmt}||{novo}|{val_str}||SALDO DE ABERTURA EM {dt_fmt}|||||"
+                                balanco_lines.append(linha)
+                                has_balanco = True
                 
-                output_balanco = "\r\n".join(saida_balanco).encode("latin-1", errors="replace")
-                if linhas > 0: st.download_button("💾 Baixar Balanço", output_balanco, f"BALANCO_{dt_fmt.replace('/','')}.txt", "text/plain", use_container_width=True)
-                else: st.warning("Sem dados.")
+                st.session_state.balanco_dados = "\r\n".join(balanco_lines).encode("latin-1", errors="replace")
+                st.session_state.balanco_totais = {"D": total_debito, "C": total_credito}
+                st.session_state.balanco_processado = True
+                st.session_state.balanco_has_data = has_balanco
+                st.rerun()
+
+            if st.session_state.balanco_processado:
+                tot = st.session_state.balanco_totais
+                diff = tot["D"] - tot["C"]
+                
+                st.markdown("---")
+                st.caption(f"Débitos: {format_moeda(tot['D'])}")
+                st.caption(f"Créditos: {format_moeda(tot['C'])}")
+                if abs(diff) > 0.01:
+                    st.error(f"Diferença: {format_moeda(diff)}")
+                else:
+                    st.success("Diferença: R$ 0,00")
+
+                if st.session_state.balanco_has_data and pendentes == 0:
+                    st.download_button(
+                        "💾 Baixar Balanço", 
+                        data=st.session_state.balanco_dados, 
+                        file_name=f"BALANCO_{nome_empresa}_{dt_fmt.replace('/','')}.txt", 
+                        mime="text/plain", 
+                        use_container_width=True
+                    )
+                elif pendentes > 0:
+                    st.warning("Resolva pendências.")
+                else:
+                    st.warning("Sem dados.")
 
         with col3:
             st.markdown("**3. Conferência**")
@@ -383,7 +473,7 @@ if file_sped and df_novo is not None:
             st.markdown("**4. Configuração**")
             if os.path.exists("Conjunto SPED.xml"):
                 with open("Conjunto SPED.xml", "rb") as f:
-                    st.download_button("⬇️ Baixar XML", f.read(), "Conjunto SPED.xml", "application/xml", use_container_width=True)
+                    st.download_button("⬇️ Conjunto de Dados", f.read(), "Conjunto SPED.xml", "application/xml", use_container_width=True)
             else: st.info("XML indisponível.")
 
     else:
