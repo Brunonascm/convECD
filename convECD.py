@@ -195,8 +195,20 @@ if file_sped and df_novo is not None:
             cod_atual = str(row['cod'])
             grupo_atual = row['grupo']
             
+            # --- df_busca: Usado APENAS pela Inteligência Artificial para não confundir o robô ---
             df_filtrado = df_novo[df_novo['Grupo'] == grupo_atual]
             df_busca = df_filtrado if not df_filtrado.empty else df_novo
+            
+            # --- df_opcoes: Usado no Dropdown (Menu Suspenso) visual ---
+            if grupo_atual in ['1', '2']:
+                # Se for 1 ou 2, blinda no próprio grupo
+                df_opcoes = df_filtrado if not df_filtrado.empty else df_novo
+            else:
+                # Se for 3, 4, 5, etc., mostra TODAS as contas, EXCETO as do Grupo 1 e 2
+                df_opcoes = df_novo[~df_novo['Grupo'].isin(['1', '2'])]
+                if df_opcoes.empty: # Segurança caso não existam contas nesses grupos
+                    df_opcoes = df_novo 
+            
             lista_nomes = df_busca['Nome'].tolist()
             
             candidatos = process.extract(row['nome'], lista_nomes, scorer=fuzz.token_set_ratio, limit=5)
@@ -239,6 +251,7 @@ if file_sped and df_novo is not None:
             process_data.append({
                 "row": row,
                 "df_busca": df_busca,
+                "df_opcoes": df_opcoes,
                 "score": score,
                 "cod_sugerido_ia": cod_sugerido_ia,
                 "display_sugerido_ia": display_sugerido_ia,
@@ -266,20 +279,27 @@ if file_sped and df_novo is not None:
                     st.caption(f"Cod no SPED: {cod_atual} | Grupo: {row['grupo']}")
                 
                 with col_destino:
-                    df_busca = item['df_busca']
-                    opcoes = ["-- SELECIONE --", "📝 -- DIGITAR MANUALMENTE --"] + df_busca['Display'].tolist()
+                    df_opcoes = item['df_opcoes']
+                    opcoes = ["-- SELECIONE --", "📝 -- DIGITAR MANUALMENTE --"] + df_opcoes['Display'].tolist()
                     chave_select = f"sel_{cod_atual}"
                     valor_inicial = opcoes[0]
                     
                     if esta_no_mapa:
-                        match_row = df_busca[df_busca['Código'] == item['valor_no_mapa']]
+                        match_row = df_novo[df_novo['Código'] == item['valor_no_mapa']]
                         if not match_row.empty:
-                            valor_inicial = match_row.iloc[0]['Display']
+                            display_str = match_row.iloc[0]['Display']
+                            if display_str in opcoes:
+                                valor_inicial = display_str
+                            else:
+                                opcoes.insert(2, display_str)
+                                valor_inicial = display_str
                         else:
                             valor_inicial = "📝 -- DIGITAR MANUALMENTE --"
                             if f"in_{cod_atual}" not in st.session_state:
                                 st.session_state[f"in_{cod_atual}"] = item['valor_no_mapa']
                     elif item['display_sugerido_ia']:
+                        if item['display_sugerido_ia'] not in opcoes:
+                            opcoes.insert(2, item['display_sugerido_ia'])
                         if chave_select not in st.session_state:
                             valor_inicial = item['display_sugerido_ia']
                         else:
@@ -300,7 +320,7 @@ if file_sped and df_novo is not None:
                     if escolha == "📝 -- DIGITAR MANUALMENTE --": pass
                     elif escolha != "-- SELECIONE --":
                         try:
-                            cod_reduzido = df_busca[df_busca['Display'] == escolha].iloc[0]['Código']
+                            cod_reduzido = escolha.split(" | ")[0]
                             if str(cod_reduzido) != item['valor_no_mapa']: novo_valor = str(cod_reduzido)
                         except: pass
                     elif escolha == "-- SELECIONE --" and esta_no_mapa:
@@ -358,7 +378,6 @@ if file_sped and df_novo is not None:
                     file_name=f"SPED_AJUSTADO_{nome_empresa}.txt", mime="text/plain", use_container_width=True
                 )
                 
-                # NOVO: Download do Conjunto SPED abaixo do botão do SPED Ajustado
                 if os.path.exists("Conjunto SPED.xml"):
                     st.markdown("---")
                     with open("Conjunto SPED.xml", "rb") as f:
@@ -476,7 +495,6 @@ if file_sped and df_novo is not None:
                         use_container_width=True
                     )
                     
-                    # NOVO: Download do Conjunto I157 abaixo do botão do I157
                     if os.path.exists("Conjunto I157.xml"):
                         st.markdown("---")
                         with open("Conjunto I157.xml", "rb") as f:
