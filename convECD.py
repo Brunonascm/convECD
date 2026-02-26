@@ -151,7 +151,7 @@ if file_sped and df_novo is not None:
                 except: pass
             break
     
-    # --- NOVO: EXTRAÇÃO INTELIGENTE DOS SALDOS INICIAIS DE TODO O SPED ---
+    # --- EXTRAÇÃO INTELIGENTE DOS SALDOS INICIAIS DE TODO O SPED ---
     initial_balances = {}
     rtl_count_i150 = 0
     for line in content_sped:
@@ -164,16 +164,18 @@ if file_sped and df_novo is not None:
                 val_str = reg[4].strip()
                 dc = reg[5].strip()
                 if cod not in initial_balances:
-                    # Se a conta apareceu logo no período 1, é o saldo real de abertura
                     if rtl_count_i150 <= 1:
                         initial_balances[cod] = (val_str, dc)
-                    # Se a conta só apareceu a partir do mês 2, o saldo inicial do ano dela foi ZERO!
                     else:
                         initial_balances[cod] = ("0,00", dc)
             
+    # --- NOVO: PEGA CONTAS COM MOVIMENTO *OU* COM SALDO PARADO (I155) ---
     contas_com_movimento = set()
     for line in content_sped:
         if line.startswith("|I250|"):
+            reg = line.split("|")
+            if len(reg) > 2: contas_com_movimento.add(reg[2].strip())
+        elif line.startswith("|I155|"):  # <-- CORREÇÃO: Garante que contas "paradas" entrem na lista
             reg = line.split("|")
             if len(reg) > 2: contas_com_movimento.add(reg[2].strip())
 
@@ -399,7 +401,7 @@ if file_sped and df_novo is not None:
                     with open("Conjunto SPED.xml", "rb") as f:
                         st.download_button("⬇️ Baixar Conjunto SPED (XML)", f.read(), "Conjunto SPED.xml", "application/xml", use_container_width=True)
 
-        # 2. BALANÇO (I155) - LOGICA CORRIGIDA PARA MENSAL E ZERO
+        # 2. BALANÇO (I155)
         with col2:
             st.markdown("**2. Balanço (I155)**")
             data_padrao = datetime.today()
@@ -415,7 +417,6 @@ if file_sped and df_novo is not None:
                 for cod_antigo in map_final_para_geracao:
                     novo = map_final_para_geracao[cod_antigo].replace("|", "")
                     
-                    # Puxa o saldo inteligente que já processamos antes
                     val_str, dc = initial_balances.get(cod_antigo, ("0,00", "D"))
                     
                     try: val_float = float(val_str.replace(",", "."))
@@ -451,7 +452,7 @@ if file_sped and df_novo is not None:
                 elif pendentes > 0: st.warning("Resolva pendências.")
                 else: st.warning("Sem dados.")
 
-        # 3. I157 (Saldos Antigos) - LOGICA CORRIGIDA PARA MENSAL E ZERO
+        # 3. I157 (Saldos Antigos)
         with col3:
             st.markdown("**3. Troca de Plano (I157)**")
             
@@ -463,7 +464,6 @@ if file_sped and df_novo is not None:
                 for cod_antigo in map_final_para_geracao:
                     novo = map_final_para_geracao[cod_antigo].replace("|", "")
                     
-                    # Puxa o saldo inteligente
                     val_str, dc = initial_balances.get(cod_antigo, ("0,00", "D"))
                     i157_data_list.append((novo, cod_antigo, val_str, dc))
                 
