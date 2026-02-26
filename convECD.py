@@ -12,7 +12,7 @@ st.set_page_config(page_title="DE/PARA SPED ECD", layout="wide")
 st.markdown("<style>.cont-row {border-bottom: 1px solid #f0f2f6; padding: 15px 0px;}</style>", unsafe_allow_html=True)
 
 st.title("🛠️ Conversor de Lançamentos ECD")
-st.info("Foco: DE/PARA lançamentos SPED ECD para Domínio")
+st.info("Foco: DE/PARA lançamentos contábil SPED ECD para Domínio")
 
 # --- INICIALIZAÇÃO DO ESTADO ---
 if 'de_para_map' not in st.session_state:
@@ -169,13 +169,13 @@ if file_sped and df_novo is not None:
                     else:
                         initial_balances[cod] = ("0,00", dc)
             
-    # --- NOVO: PEGA CONTAS COM MOVIMENTO *OU* COM SALDO PARADO (I155) ---
+    # --- PEGA CONTAS COM MOVIMENTO *OU* COM SALDO PARADO (I155) ---
     contas_com_movimento = set()
     for line in content_sped:
         if line.startswith("|I250|"):
             reg = line.split("|")
             if len(reg) > 2: contas_com_movimento.add(reg[2].strip())
-        elif line.startswith("|I155|"):  # <-- CORREÇÃO: Garante que contas "paradas" entrem na lista
+        elif line.startswith("|I155|"):
             reg = line.split("|")
             if len(reg) > 2: contas_com_movimento.add(reg[2].strip())
 
@@ -422,12 +422,14 @@ if file_sped and df_novo is not None:
                     try: val_float = float(val_str.replace(",", "."))
                     except: val_float = 0.0
                     
-                    if dc == 'D': total_debito += val_float
-                    else: total_credito += val_float
-                    
-                    linha = f"|6100|{dt_fmt}|{novo}||{val_str}||SALDO DE ABERTURA EM {dt_fmt}|||||" if dc == 'D' else f"|6100|{dt_fmt}||{novo}|{val_str}||SALDO DE ABERTURA EM {dt_fmt}|||||"
-                    balanco_lines.append(linha)
-                    has_balanco = True
+                    # --- NOVO FILTRO ANTI-ZERO (DOMÍNIO REJEITA ZEROS NO BALANÇO) ---
+                    if val_float > 0:
+                        if dc == 'D': total_debito += val_float
+                        else: total_credito += val_float
+                        
+                        linha = f"|6100|{dt_fmt}|{novo}||{val_str}||SALDO DE ABERTURA EM {dt_fmt}|||||" if dc == 'D' else f"|6100|{dt_fmt}||{novo}|{val_str}||SALDO DE ABERTURA EM {dt_fmt}|||||"
+                        balanco_lines.append(linha)
+                        has_balanco = True
                 
                 st.session_state.balanco_dados = "\r\n".join(balanco_lines).encode("latin-1", errors="replace")
                 st.session_state.balanco_totais = {"D": total_debito, "C": total_credito}
@@ -463,9 +465,14 @@ if file_sped and df_novo is not None:
                 
                 for cod_antigo in map_final_para_geracao:
                     novo = map_final_para_geracao[cod_antigo].replace("|", "")
-                    
                     val_str, dc = initial_balances.get(cod_antigo, ("0,00", "D"))
-                    i157_data_list.append((novo, cod_antigo, val_str, dc))
+                    
+                    try: val_float = float(val_str.replace(",", "."))
+                    except: val_float = 0.0
+                    
+                    # --- NOVO FILTRO ANTI-ZERO (DOMÍNIO REJEITA ZEROS NO I157) ---
+                    if val_float > 0:
+                        i157_data_list.append((novo, cod_antigo, val_str, dc))
                 
                 if i157_data_list:
                     i157_data_list.sort(key=lambda x: str(x[0]))
@@ -522,5 +529,4 @@ if file_sped and df_novo is not None:
 if 'de_para_map' in st.session_state and len(st.session_state.de_para_map) > 0:
     with placeholder_botao_salvar:
         st.download_button("⬇️ Salvar Progresso Atual", json.dumps(st.session_state.de_para_map, indent=4), "backup_mapeamento_ecd.json", "application/json", help="Baixe para continuar depois.")
-
 else: st.info("Aguardando arquivos...")
