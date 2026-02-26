@@ -181,7 +181,7 @@ if file_sped and df_novo is not None:
                     else:
                         initial_balances[cod] = ("0,00", dc_ini)
                 
-                # Saldo Final (Sempre atualiza, então a última vez que ele ler a conta será o valor de Dezembro)
+                # Saldo Final (Sempre atualiza, então a última vez que ele ler a conta será o valor final)
                 final_balances[cod] = (val_fin_str, dc_fin)
             
     # --- PEGA CONTAS COM MOVIMENTO *OU* COM SALDO PARADO (I155) ---
@@ -219,7 +219,8 @@ if file_sped and df_novo is not None:
                         "grupo": reg[pos_classif][0] if len(reg[pos_classif]) > 0 else ""
                     })
     
-    df_origem = pd.DataFrame(contas_origem_data).drop_duplicates()
+    # --- CORREÇÃO DO ERRO DUPLICATE KEY: Garantir que cada código só apareça UMA VEZ ---
+    df_origem = pd.DataFrame(contas_origem_data).drop_duplicates(subset=['cod'])
 
     if not df_origem.empty:
         
