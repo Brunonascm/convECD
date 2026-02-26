@@ -12,7 +12,7 @@ st.set_page_config(page_title="DE/PARA SPED ECD", layout="wide")
 st.markdown("<style>.cont-row {border-bottom: 1px solid #f0f2f6; padding: 15px 0px;}</style>", unsafe_allow_html=True)
 
 st.title("🛠️ Conversor de Lançamentos ECD")
-st.info("Foco: DE/PARA lançamentos contábil SPED ECD para Domínio")
+st.info("Foco: Substituição pelo **Código Reduzido** com indicadores de progresso.")
 
 # --- INICIALIZAÇÃO DO ESTADO ---
 if 'de_para_map' not in st.session_state:
@@ -138,6 +138,7 @@ if file_sped and df_novo is not None:
     # --- EXTRAÇÃO DE DADOS DO CABEÇALHO (REGISTRO 0000) ---
     nome_empresa = "EMPRESA"
     dt_inicial_sped = None
+    dt_final_sped = None
     
     for line in content_sped:
         if line.startswith("|0000|"):
@@ -149,25 +150,39 @@ if file_sped and df_novo is not None:
                     dt_str = parts[3] 
                     dt_inicial_sped = datetime.strptime(dt_str, "%d%m%Y").date()
                 except: pass
+            if len(parts) > 4:
+                try:
+                    dt_str_fin = parts[4] 
+                    dt_final_sped = datetime.strptime(dt_str_fin, "%d%m%Y").date()
+                except: pass
             break
     
-    # --- EXTRAÇÃO INTELIGENTE DOS SALDOS INICIAIS DE TODO O SPED ---
+    # --- EXTRAÇÃO INTELIGENTE DOS SALDOS (INICIAIS E FINAIS) ---
     initial_balances = {}
+    final_balances = {}
     rtl_count_i150 = 0
+    
     for line in content_sped:
         if line.startswith("|I150|"):
             rtl_count_i150 += 1
         elif line.startswith("|I155|"):
             reg = line.split("|")
-            if len(reg) > 5:
+            if len(reg) >= 10:
                 cod = reg[2].strip()
-                val_str = reg[4].strip()
-                dc = reg[5].strip()
+                val_ini_str = reg[4].strip()
+                dc_ini = reg[5].strip()
+                val_fin_str = reg[8].strip()  # Coluna do Saldo Final
+                dc_fin = reg[9].strip()       # Coluna D/C do Saldo Final
+                
+                # Saldo Inicial
                 if cod not in initial_balances:
                     if rtl_count_i150 <= 1:
-                        initial_balances[cod] = (val_str, dc)
+                        initial_balances[cod] = (val_ini_str, dc_ini)
                     else:
-                        initial_balances[cod] = ("0,00", dc)
+                        initial_balances[cod] = ("0,00", dc_ini)
+                
+                # Saldo Final (Sempre atualiza, então a última vez que ele ler a conta será o valor de Dezembro)
+                final_balances[cod] = (val_fin_str, dc_fin)
             
     # --- PEGA CONTAS COM MOVIMENTO *OU* COM SALDO PARADO (I155) ---
     contas_com_movimento = set()
@@ -401,11 +416,18 @@ if file_sped and df_novo is not None:
                     with open("Conjunto SPED.xml", "rb") as f:
                         st.download_button("⬇️ Baixar Conjunto SPED (XML)", f.read(), "Conjunto SPED.xml", "application/xml", use_container_width=True)
 
-        # 2. BALANÇO (I155)
+        # 2. BALANÇO (I155) - OPÇÃO INICIAL/FINAL
         with col2:
             st.markdown("**2. Balanço (I155)**")
+            
+            tipo_saldo = st.radio("Referência do Saldo:", ["Inicial (Abertura)", "Final (Fechamento)"])
+            
             data_padrao = datetime.today()
-            if dt_inicial_sped: data_padrao = dt_inicial_sped - timedelta(days=1)
+            if tipo_saldo == "Inicial (Abertura)" and dt_inicial_sped: 
+                data_padrao = dt_inicial_sped - timedelta(days=1)
+            elif tipo_saldo == "Final (Fechamento)" and dt_final_sped:
+                data_padrao = dt_final_sped
+                
             data_balanco = st.date_input("Data p/ Balanço:", data_padrao, format="DD/MM/YYYY")
             dt_fmt = data_balanco.strftime("%d/%m/%Y")
             
@@ -417,12 +439,14 @@ if file_sped and df_novo is not None:
                 for cod_antigo in map_final_para_geracao:
                     novo = map_final_para_geracao[cod_antigo].replace("|", "")
                     
-                    val_str, dc = initial_balances.get(cod_antigo, ("0,00", "D"))
+                    if tipo_saldo == "Inicial (Abertura)":
+                        val_str, dc = initial_balances.get(cod_antigo, ("0,00", "D"))
+                    else:
+                        val_str, dc = final_balances.get(cod_antigo, ("0,00", "D"))
                     
                     try: val_float = float(val_str.replace(",", "."))
                     except: val_float = 0.0
                     
-                    # --- NOVO FILTRO ANTI-ZERO (DOMÍNIO REJEITA ZEROS NO BALANÇO) ---
                     if val_float > 0:
                         if dc == 'D': total_debito += val_float
                         else: total_credito += val_float
@@ -470,7 +494,6 @@ if file_sped and df_novo is not None:
                     try: val_float = float(val_str.replace(",", "."))
                     except: val_float = 0.0
                     
-                    # --- NOVO FILTRO ANTI-ZERO (DOMÍNIO REJEITA ZEROS NO I157) ---
                     if val_float > 0:
                         i157_data_list.append((novo, cod_antigo, val_str, dc))
                 
