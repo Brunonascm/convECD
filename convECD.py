@@ -150,6 +150,26 @@ if file_sped and df_novo is not None:
                     dt_inicial_sped = datetime.strptime(dt_str, "%d%m%Y").date()
                 except: pass
             break
+    
+    # --- NOVO: EXTRAÇÃO INTELIGENTE DOS SALDOS INICIAIS DE TODO O SPED ---
+    initial_balances = {}
+    rtl_count_i150 = 0
+    for line in content_sped:
+        if line.startswith("|I150|"):
+            rtl_count_i150 += 1
+        elif line.startswith("|I155|"):
+            reg = line.split("|")
+            if len(reg) > 5:
+                cod = reg[2].strip()
+                val_str = reg[4].strip()
+                dc = reg[5].strip()
+                if cod not in initial_balances:
+                    # Se a conta apareceu logo no período 1, é o saldo real de abertura
+                    if rtl_count_i150 <= 1:
+                        initial_balances[cod] = (val_str, dc)
+                    # Se a conta só apareceu a partir do mês 2, o saldo inicial do ano dela foi ZERO!
+                    else:
+                        initial_balances[cod] = ("0,00", dc)
             
     contas_com_movimento = set()
     for line in content_sped:
@@ -195,18 +215,14 @@ if file_sped and df_novo is not None:
             cod_atual = str(row['cod'])
             grupo_atual = row['grupo']
             
-            # --- df_busca: Usado APENAS pela Inteligência Artificial para não confundir o robô ---
             df_filtrado = df_novo[df_novo['Grupo'] == grupo_atual]
             df_busca = df_filtrado if not df_filtrado.empty else df_novo
             
-            # --- df_opcoes: Usado no Dropdown (Menu Suspenso) visual ---
             if grupo_atual in ['1', '2']:
-                # Se for 1 ou 2, blinda no próprio grupo
                 df_opcoes = df_filtrado if not df_filtrado.empty else df_novo
             else:
-                # Se for 3, 4, 5, etc., mostra TODAS as contas, EXCETO as do Grupo 1 e 2
                 df_opcoes = df_novo[~df_novo['Grupo'].isin(['1', '2'])]
-                if df_opcoes.empty: # Segurança caso não existam contas nesses grupos
+                if df_opcoes.empty:
                     df_opcoes = df_novo 
             
             lista_nomes = df_busca['Nome'].tolist()
@@ -383,7 +399,7 @@ if file_sped and df_novo is not None:
                     with open("Conjunto SPED.xml", "rb") as f:
                         st.download_button("⬇️ Baixar Conjunto SPED (XML)", f.read(), "Conjunto SPED.xml", "application/xml", use_container_width=True)
 
-        # 2. BALANÇO (I155)
+        # 2. BALANÇO (I155) - LOGICA CORRIGIDA PARA MENSAL E ZERO
         with col2:
             st.markdown("**2. Balanço (I155)**")
             data_padrao = datetime.today()
@@ -394,24 +410,23 @@ if file_sped and df_novo is not None:
             if st.button("🔍 Processar Balanço"):
                 balanco_lines = ["|6000|V||||"]
                 total_debito, total_credito = 0.0, 0.0
-                rtl_count = 0
                 has_balanco = False
                 
-                for line in content_sped:
-                    if line.startswith("|I150|"): rtl_count += 1
-                    if rtl_count == 1 and line.startswith("|I155|"):
-                        reg = line.split("|")
-                        if len(reg) > 5:
-                            cod = reg[2].strip(); val_str = reg[4].strip(); dc = reg[5].strip()
-                            try: val_float = float(val_str.replace(",", "."))
-                            except: val_float = 0.0
-                            if cod in map_final_para_geracao and val_float > 0:
-                                novo = map_final_para_geracao[cod].replace("|", "")
-                                if dc == 'D': total_debito += val_float
-                                else: total_credito += val_float
-                                linha = f"|6100|{dt_fmt}|{novo}||{val_str}||SALDO DE ABERTURA EM {dt_fmt}|||||" if dc == 'D' else f"|6100|{dt_fmt}||{novo}|{val_str}||SALDO DE ABERTURA EM {dt_fmt}|||||"
-                                balanco_lines.append(linha)
-                                has_balanco = True
+                for cod_antigo in map_final_para_geracao:
+                    novo = map_final_para_geracao[cod_antigo].replace("|", "")
+                    
+                    # Puxa o saldo inteligente que já processamos antes
+                    val_str, dc = initial_balances.get(cod_antigo, ("0,00", "D"))
+                    
+                    try: val_float = float(val_str.replace(",", "."))
+                    except: val_float = 0.0
+                    
+                    if dc == 'D': total_debito += val_float
+                    else: total_credito += val_float
+                    
+                    linha = f"|6100|{dt_fmt}|{novo}||{val_str}||SALDO DE ABERTURA EM {dt_fmt}|||||" if dc == 'D' else f"|6100|{dt_fmt}||{novo}|{val_str}||SALDO DE ABERTURA EM {dt_fmt}|||||"
+                    balanco_lines.append(linha)
+                    has_balanco = True
                 
                 st.session_state.balanco_dados = "\r\n".join(balanco_lines).encode("latin-1", errors="replace")
                 st.session_state.balanco_totais = {"D": total_debito, "C": total_credito}
@@ -436,34 +451,21 @@ if file_sped and df_novo is not None:
                 elif pendentes > 0: st.warning("Resolva pendências.")
                 else: st.warning("Sem dados.")
 
-        # 3. I157 (Saldos Antigos)
+        # 3. I157 (Saldos Antigos) - LOGICA CORRIGIDA PARA MENSAL E ZERO
         with col3:
             st.markdown("**3. Troca de Plano (I157)**")
             
             if st.button("🔄 Processar I157"):
                 i157_lines = ["ID;;;;;;"]
-                rtl_count = 0
                 has_i157 = False
                 i157_data_list = []
                 
-                for line in content_sped:
-                    if line.startswith("|I150|"): rtl_count += 1
+                for cod_antigo in map_final_para_geracao:
+                    novo = map_final_para_geracao[cod_antigo].replace("|", "")
                     
-                    if rtl_count == 1 and line.startswith("|I155|"):
-                        reg = line.split("|")
-                        if len(reg) > 5:
-                            cod_antigo = reg[2].strip()
-                            val_str = reg[4].strip()
-                            dc = reg[5].strip()
-                            
-                            try:
-                                val_float = float(val_str.replace(",", "."))
-                            except:
-                                val_float = 0.0
-                                
-                            if cod_antigo in map_final_para_geracao and val_float > 0:
-                                novo = map_final_para_geracao[cod_antigo].replace("|", "")
-                                i157_data_list.append((novo, cod_antigo, val_str, dc))
+                    # Puxa o saldo inteligente
+                    val_str, dc = initial_balances.get(cod_antigo, ("0,00", "D"))
+                    i157_data_list.append((novo, cod_antigo, val_str, dc))
                 
                 if i157_data_list:
                     i157_data_list.sort(key=lambda x: str(x[0]))
