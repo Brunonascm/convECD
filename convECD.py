@@ -12,7 +12,7 @@ st.set_page_config(page_title="DE/PARA SPED ECD", layout="wide")
 st.markdown("<style>.cont-row {border-bottom: 1px solid #f0f2f6; padding: 15px 0px;}</style>", unsafe_allow_html=True)
 
 st.title("🛠️ Conversor de Lançamentos ECD")
-st.info("Foco: Substituição pelo **Código Reduzido** com indicadores de progresso.")
+st.info("Foco: DE/PARA lançamentos contábeis SPED ECD para Domínio.")
 
 # --- INICIALIZAÇÃO DO ESTADO ---
 if 'de_para_map' not in st.session_state:
@@ -553,4 +553,5 @@ if file_sped and df_novo is not None:
 if 'de_para_map' in st.session_state and len(st.session_state.de_para_map) > 0:
     with placeholder_botao_salvar:
         st.download_button("⬇️ Salvar Progresso Atual", json.dumps(st.session_state.de_para_map, indent=4), "backup_mapeamento_ecd.json", "application/json", help="Baixe para continuar depois.")
+
 else: st.info("Aguardando arquivos...")
