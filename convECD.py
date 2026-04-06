@@ -131,14 +131,13 @@ ocultar_mapeadas = st.sidebar.checkbox("Ocultar contas já mapeadas?", value=Fal
 if file_sped and df_novo is not None:
     df_novo = df_novo.astype(str)
     df_novo['Display'] = df_novo['Código'] + " | " + df_novo['Classificação'] + " - " + df_novo['Nome']
-    df_novo['Grupo'] = df_novo['Classificação'].str[0]
+    df_novo['Grupo'] = df_novo['Classificação'].str.lstrip('0').str[0] # ALTERAÇÃO V44: Ignora 0 à esquerda
 
     content_sped = ler_arquivo_texto_seguro(file_sped)
     
     # --- EXTRAÇÃO DE DADOS DO CABEÇALHO (REGISTRO 0000) ---
     nome_empresa = "EMPRESA"
     dt_inicial_sped = None
-    dt_final_sped = None
     
     for line in content_sped:
         if line.startswith("|0000|"):
@@ -150,47 +149,27 @@ if file_sped and df_novo is not None:
                     dt_str = parts[3] 
                     dt_inicial_sped = datetime.strptime(dt_str, "%d%m%Y").date()
                 except: pass
-            if len(parts) > 4:
-                try:
-                    dt_str_fin = parts[4] 
-                    dt_final_sped = datetime.strptime(dt_str_fin, "%d%m%Y").date()
-                except: pass
             break
     
-    # --- EXTRAÇÃO INTELIGENTE DOS SALDOS (INICIAIS E FINAIS) ---
+    # --- EXTRAÇÃO DOS SALDOS INICIAIS (I155) ---
     initial_balances = {}
-    final_balances = {}
     rtl_count_i150 = 0
-    
     for line in content_sped:
         if line.startswith("|I150|"):
             rtl_count_i150 += 1
-        elif line.startswith("|I155|"):
+        if rtl_count_i150 == 1 and line.startswith("|I155|"):
             reg = line.split("|")
-            if len(reg) >= 10:
+            if len(reg) > 5:
                 cod = reg[2].strip()
-                val_ini_str = reg[4].strip()
-                dc_ini = reg[5].strip()
-                val_fin_str = reg[8].strip()  # Coluna do Saldo Final
-                dc_fin = reg[9].strip()       # Coluna D/C do Saldo Final
-                
-                # Saldo Inicial
-                if cod not in initial_balances:
-                    if rtl_count_i150 <= 1:
-                        initial_balances[cod] = (val_ini_str, dc_ini)
-                    else:
-                        initial_balances[cod] = ("0,00", dc_ini)
-                
-                # Saldo Final (Sempre atualiza, então a última vez que ele ler a conta será o valor final)
-                final_balances[cod] = (val_fin_str, dc_fin)
-            
-    # --- PEGA CONTAS COM MOVIMENTO *OU* COM SALDO PARADO (I155) ---
+                val_str = reg[4].strip()
+                dc = reg[5].strip()
+                initial_balances[cod] = (val_str, dc)
+        elif rtl_count_i150 > 1:
+            break
+
     contas_com_movimento = set()
     for line in content_sped:
         if line.startswith("|I250|"):
-            reg = line.split("|")
-            if len(reg) > 2: contas_com_movimento.add(reg[2].strip())
-        elif line.startswith("|I155|"):
             reg = line.split("|")
             if len(reg) > 2: contas_com_movimento.add(reg[2].strip())
 
@@ -216,11 +195,10 @@ if file_sped and df_novo is not None:
                         "cod": cod_encontrado, 
                         "classif": reg[pos_classif].strip(), 
                         "nome": nome_conta, 
-                        "grupo": reg[pos_classif][0] if len(reg[pos_classif]) > 0 else ""
+                        "grupo": reg[pos_classif].lstrip('0')[0] if len(reg[pos_classif].lstrip('0')) > 0 else "" # ALTERAÇÃO V44: Ignora 0 à esquerda
                     })
     
-    # --- CORREÇÃO DO ERRO DUPLICATE KEY: Garantir que cada código só apareça UMA VEZ ---
-    df_origem = pd.DataFrame(contas_origem_data).drop_duplicates(subset=['cod'])
+    df_origem = pd.DataFrame(contas_origem_data).drop_duplicates()
 
     if not df_origem.empty:
         
@@ -417,18 +395,11 @@ if file_sped and df_novo is not None:
                     with open("Conjunto SPED.xml", "rb") as f:
                         st.download_button("⬇️ Baixar Conjunto SPED (XML)", f.read(), "Conjunto SPED.xml", "application/xml", use_container_width=True)
 
-        # 2. BALANÇO (I155) - OPÇÃO INICIAL/FINAL
+        # 2. BALANÇO (I155)
         with col2:
             st.markdown("**2. Balanço (I155)**")
-            
-            tipo_saldo = st.radio("Referência do Saldo:", ["Inicial (Abertura)", "Final (Fechamento)"])
-            
             data_padrao = datetime.today()
-            if tipo_saldo == "Inicial (Abertura)" and dt_inicial_sped: 
-                data_padrao = dt_inicial_sped - timedelta(days=1)
-            elif tipo_saldo == "Final (Fechamento)" and dt_final_sped:
-                data_padrao = dt_final_sped
-                
+            if dt_inicial_sped: data_padrao = dt_inicial_sped - timedelta(days=1)
             data_balanco = st.date_input("Data p/ Balanço:", data_padrao, format="DD/MM/YYYY")
             dt_fmt = data_balanco.strftime("%d/%m/%Y")
             
@@ -440,21 +411,17 @@ if file_sped and df_novo is not None:
                 for cod_antigo in map_final_para_geracao:
                     novo = map_final_para_geracao[cod_antigo].replace("|", "")
                     
-                    if tipo_saldo == "Inicial (Abertura)":
-                        val_str, dc = initial_balances.get(cod_antigo, ("0,00", "D"))
-                    else:
-                        val_str, dc = final_balances.get(cod_antigo, ("0,00", "D"))
+                    val_str, dc = initial_balances.get(cod_antigo, ("0,00", "D"))
                     
                     try: val_float = float(val_str.replace(",", "."))
                     except: val_float = 0.0
                     
-                    if val_float > 0:
-                        if dc == 'D': total_debito += val_float
-                        else: total_credito += val_float
-                        
-                        linha = f"|6100|{dt_fmt}|{novo}||{val_str}||SALDO DE ABERTURA EM {dt_fmt}|||||" if dc == 'D' else f"|6100|{dt_fmt}||{novo}|{val_str}||SALDO DE ABERTURA EM {dt_fmt}|||||"
-                        balanco_lines.append(linha)
-                        has_balanco = True
+                    if dc == 'D': total_debito += val_float
+                    else: total_credito += val_float
+                    
+                    linha = f"|6100|{dt_fmt}|{novo}||{val_str}||SALDO DE ABERTURA EM {dt_fmt}|||||" if dc == 'D' else f"|6100|{dt_fmt}||{novo}|{val_str}||SALDO DE ABERTURA EM {dt_fmt}|||||"
+                    balanco_lines.append(linha)
+                    has_balanco = True
                 
                 st.session_state.balanco_dados = "\r\n".join(balanco_lines).encode("latin-1", errors="replace")
                 st.session_state.balanco_totais = {"D": total_debito, "C": total_credito}
@@ -552,5 +519,5 @@ if file_sped and df_novo is not None:
 
 if 'de_para_map' in st.session_state and len(st.session_state.de_para_map) > 0:
     with placeholder_botao_salvar:
-        st.download_button("⬇️ Salvar Progresso Atual", json.dumps(st.session_state.de_para_map, indent=4), "backup_mapeamento_ecd.json", "application/json", help="Baixe para continuar depois.")
+        st.download_button("⬇️ Salvar Backup", json.dumps(st.session_state.de_para_map), "backup.json")
 else: st.info("Aguardando arquivos...")
