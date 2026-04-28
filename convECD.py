@@ -131,7 +131,7 @@ ocultar_mapeadas = st.sidebar.checkbox("Ocultar contas já mapeadas?", value=Fal
 if file_sped and df_novo is not None:
     df_novo = df_novo.astype(str)
     df_novo['Display'] = df_novo['Código'] + " | " + df_novo['Classificação'] + " - " + df_novo['Nome']
-    df_novo['Grupo'] = df_novo['Classificação'].str.lstrip('0').str[0] # ALTERAÇÃO V44: Ignora 0 à esquerda
+    df_novo['Grupo'] = df_novo['Classificação'].str.lstrip('0').str[0] # AJUSTE GRUPO 0
 
     content_sped = ler_arquivo_texto_seguro(file_sped)
     
@@ -172,8 +172,23 @@ if file_sped and df_novo is not None:
         if line.startswith("|I250|"):
             reg = line.split("|")
             if len(reg) > 2: contas_com_movimento.add(reg[2].strip())
+        elif line.startswith("|I155|"): # CAPTURA CONTAS SEM MOVIMENTO NO ANO
+            reg = line.split("|")
+            if len(reg) > 2: contas_com_movimento.add(reg[2].strip())
+        # COMPLEMENTO V46: RESGATE DE SALDOS DO J100 (BALANÇO)
+        elif line.startswith("|J100|"):
+            reg = line.split("|")
+            if len(reg) > 8:
+                cod_j = reg[2].strip()
+                val_j = reg[8].strip() # Saldo Inicial no J100
+                dc_j = reg[9].strip()  # Natureza no J100
+                if cod_j and cod_j not in initial_balances and val_j != "0,00":
+                    initial_balances[cod_j] = (val_j, dc_j)
+                    contas_com_movimento.add(cod_j)
 
     contas_origem_data = []
+    info_contas_base = {} # Para rastrear o que já achamos no I050
+    
     for line in content_sped:
         if line.startswith("|I050|"):
             reg = line.split("|")
@@ -195,10 +210,21 @@ if file_sped and df_novo is not None:
                         "cod": cod_encontrado, 
                         "classif": reg[pos_classif].strip(), 
                         "nome": nome_conta, 
-                        "grupo": reg[pos_classif].lstrip('0')[0] if len(reg[pos_classif].lstrip('0')) > 0 else "" # ALTERAÇÃO V44: Ignora 0 à esquerda
+                        "grupo": reg[pos_classif].lstrip('0')[0] if len(reg[pos_classif].lstrip('0')) > 0 else ""
                     })
+                    info_contas_base[cod_encontrado] = True
+
+    # CAPTURA DE CONTAS ÓRFÃS (Estão no movimento mas não no I050)
+    for cod_orfao in contas_com_movimento:
+        if cod_orfao not in info_contas_base:
+            contas_origem_data.append({
+                "cod": cod_orfao,
+                "classif": cod_orfao,
+                "nome": f"⚠️ CONTA NÃO DECLARADA NO I050 ({cod_orfao})",
+                "grupo": cod_orfao.lstrip('0')[0] if len(cod_orfao.lstrip('0')) > 0 else ""
+            })
     
-    df_origem = pd.DataFrame(contas_origem_data).drop_duplicates()
+    df_origem = pd.DataFrame(contas_origem_data).drop_duplicates(subset=['cod'])
 
     if not df_origem.empty:
         
@@ -369,7 +395,8 @@ if file_sped and df_novo is not None:
                 if line.startswith("|9999|"):
                     saida.append(line)
                     break
-                if line.startswith("|I250|"):
+                # SUBSTITUIÇÃO GLOBAL (I250, I155, I052)
+                if any(line.startswith(prefix) for prefix in ["|I250|", "|I155|", "|I052|"]):
                     reg = line.split("|")
                     if len(reg) > 2 and reg[2] in map_final_para_geracao:
                         novo_cod = str(map_final_para_geracao[reg[2]]).strip().replace("|", "")
@@ -416,12 +443,13 @@ if file_sped and df_novo is not None:
                     try: val_float = float(val_str.replace(",", "."))
                     except: val_float = 0.0
                     
-                    if dc == 'D': total_debito += val_float
-                    else: total_credito += val_float
-                    
-                    linha = f"|6100|{dt_fmt}|{novo}||{val_str}||SALDO DE ABERTURA EM {dt_fmt}|||||" if dc == 'D' else f"|6100|{dt_fmt}||{novo}|{val_str}||SALDO DE ABERTURA EM {dt_fmt}|||||"
-                    balanco_lines.append(linha)
-                    has_balanco = True
+                    if val_float > 0: # FILTRO ANTI-ZERO DOMÍNIO
+                        if dc == 'D': total_debito += val_float
+                        else: total_credito += val_float
+                        
+                        linha = f"|6100|{dt_fmt}|{novo}||{val_str}||SALDO DE ABERTURA EM {dt_fmt}|||||" if dc == 'D' else f"|6100|{dt_fmt}||{novo}|{val_str}||SALDO DE ABERTURA EM {dt_fmt}|||||"
+                        balanco_lines.append(linha)
+                        has_balanco = True
                 
                 st.session_state.balanco_dados = "\r\n".join(balanco_lines).encode("latin-1", errors="replace")
                 st.session_state.balanco_totais = {"D": total_debito, "C": total_credito}
@@ -462,7 +490,7 @@ if file_sped and df_novo is not None:
                     try: val_float = float(val_str.replace(",", "."))
                     except: val_float = 0.0
                     
-                    if val_float > 0:
+                    if val_float > 0: # FILTRO ANTI-ZERO DOMÍNIO
                         i157_data_list.append((novo, cod_antigo, val_str, dc))
                 
                 if i157_data_list:
