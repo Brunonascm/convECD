@@ -175,16 +175,6 @@ if file_sped and df_novo is not None:
         elif line.startswith("|I155|"): # CAPTURA CONTAS SEM MOVIMENTO NO ANO
             reg = line.split("|")
             if len(reg) > 2: contas_com_movimento.add(reg[2].strip())
-        # COMPLEMENTO V46: RESGATE DE SALDOS DO J100 (BALANÇO)
-        elif line.startswith("|J100|"):
-            reg = line.split("|")
-            if len(reg) > 8:
-                cod_j = reg[2].strip()
-                val_j = reg[8].strip() # Saldo Inicial no J100
-                dc_j = reg[9].strip()  # Natureza no J100
-                if cod_j and cod_j not in initial_balances and val_j != "0,00":
-                    initial_balances[cod_j] = (val_j, dc_j)
-                    contas_com_movimento.add(cod_j)
 
     contas_origem_data = []
     info_contas_base = {} # Para rastrear o que já achamos no I050
