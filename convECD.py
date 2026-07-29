@@ -201,11 +201,10 @@ if file_sped and df_novo is not None:
             if len(reg) > 6:
                 cod_encontrado = None
                 pos_classif = -1
-                for i in [5, 6, 7]:
-                    if i < len(reg) and reg[i].strip() in contas_com_movimento:
-                        cod_encontrado = reg[i].strip()
-                        pos_classif = i
-                        break
+                cod_cta_fixo = reg[6].strip()
+                if cod_cta_fixo in contas_com_movimento:
+                    cod_encontrado = cod_cta_fixo
+                    pos_classif = 6
                 if cod_encontrado:
                     nome_conta = "Sem Nome"
                     for j in range(pos_classif + 1, len(reg)):
