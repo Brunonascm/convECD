@@ -66,14 +66,21 @@ st.sidebar.header("Configurações")
 file_sped = st.sidebar.file_uploader("1. Arquivo SPED (TXT)", type=["txt"])
 usar_padrao = st.sidebar.checkbox("Usar Plano de Contas Padrão UNSÃO?", value=True)
 
-# --- CARREGAMENTO DO PLANO ---
+# --- CARREGAMENTO DO PLANO COM SUPORTE À COLUNA DE TIPO ---
 df_novo = None
 if usar_padrao:
     caminho_padrao = "plano_padrao.xlsx"
     if os.path.exists(caminho_padrao):
         try:
-            df_novo = pd.read_excel(caminho_padrao, header=None).iloc[:, [0, 1, 2]]
-            df_novo.columns = ['Código', 'Classificação', 'Nome']
+            df_raw = pd.read_excel(caminho_padrao, header=None)
+            # Verifica se possui a 4ª coluna de tipo (Analítica/Sintética)
+            if df_raw.shape[1] >= 4:
+                df_novo = df_raw.iloc[:, [0, 1, 2, 3]]
+                df_novo.columns = ['Código', 'Classificação', 'Nome', 'Tipo']
+            else:
+                df_novo = df_raw.iloc[:, [0, 1, 2]]
+                df_novo.columns = ['Código', 'Classificação', 'Nome']
+                df_novo['Tipo'] = 'A' # Default para Analítica se não existir a coluna
         except:
             st.sidebar.error("Erro ao ler plano_padrao.xlsx")
     else:
@@ -84,19 +91,30 @@ else:
     with st.sidebar.expander("ℹ️ Ver Modelo / Baixar Exemplo"):
         st.write("Seu Excel deve seguir estritamente esta ordem (sem cabeçalho):")
         df_exemplo_visual = pd.DataFrame({
-            "Coluna A": ["50", "51", "..."],
-            "Coluna B": ["1.01.01", "1.01.02", "..."],
-            "Coluna C": ["CAIXA GERAL", "BANCO CONTA MOV.", "..."]
+            "Coluna A (Código)": ["50", "51", "..."],
+            "Coluna B (Classif.)": ["1.01.01", "1.01.02", "..."],
+            "Coluna C (Nome)": ["CAIXA GERAL", "BANCO CONTA MOV.", "..."],
+            "Coluna D (Tipo)": ["A", "A", "... (A = Analítica / S = Sintética)"]
         })
         st.table(df_exemplo_visual)
         buffer = io.BytesIO()
         with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
-            pd.DataFrame(columns=['A', 'B', 'C']).to_excel(writer, sheet_name='Plan1', header=False, index=False)
+            # Cria modelo contendo 4 colunas em branco
+            pd.DataFrame(columns=['A', 'B', 'C', 'D']).to_excel(writer, sheet_name='Plan1', header=False, index=False)
         st.download_button("⬇️ Baixar Planilha Modelo", buffer, "Modelo_Plano_Contas.xlsx", "application/vnd.ms-excel")
 
     if file_excel:
-        df_novo = pd.read_excel(file_excel, header=None).iloc[:, [0, 1, 2]]
-        df_novo.columns = ['Código', 'Classificação', 'Nome']
+        try:
+            df_raw = pd.read_excel(file_excel, header=None)
+            if df_raw.shape[1] >= 4:
+                df_novo = df_raw.iloc[:, [0, 1, 2, 3]]
+                df_novo.columns = ['Código', 'Classificação', 'Nome', 'Tipo']
+            else:
+                df_novo = df_raw.iloc[:, [0, 1, 2]]
+                df_novo.columns = ['Código', 'Classificação', 'Nome']
+                df_novo['Tipo'] = 'A'
+        except Exception as e:
+            st.sidebar.error(f"Erro ao ler arquivo Excel: {e}")
 
 # --- SEÇÃO BACKUP ---
 st.sidebar.divider()
@@ -130,6 +148,13 @@ ocultar_mapeadas = st.sidebar.checkbox("Ocultar contas já mapeadas?", value=Fal
 # --- Lógica Principal ---
 if file_sped and df_novo is not None:
     df_novo = df_novo.astype(str)
+    
+    # --- FILTRAR APENAS CONTAS ANALÍTICAS (Exclui Sintéticas do processo) ---
+    if 'Tipo' in df_novo.columns:
+        df_novo['Tipo'] = df_novo['Tipo'].str.strip().str.upper()
+        # Remove do plano de destino qualquer conta cujo Tipo inicie com 'S' (Ex: S, Sintetica, Sintética)
+        df_novo = df_novo[~df_novo['Tipo'].str.startswith(('S', 'SIN'))]
+        
     df_novo['Display'] = df_novo['Código'] + " | " + df_novo['Classificação'] + " - " + df_novo['Nome']
     df_novo['Grupo'] = df_novo['Classificação'].str[0]
 
