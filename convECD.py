@@ -18,6 +18,9 @@ st.info("Foco: Substituição pelo **Código Reduzido** com indicadores de progr
 if 'de_para_map' not in st.session_state:
     st.session_state.de_para_map = {}
 
+if 'conferidos' not in st.session_state:
+    st.session_state.conferidos = {}
+
 if 'balanco_processado' not in st.session_state:
     st.session_state.balanco_processado = False
     st.session_state.balanco_dados = None
@@ -50,6 +53,11 @@ def atualizar_dropdown(cod_conta, chave_select):
         if str(cod_conta) in st.session_state.de_para_map:
             del st.session_state.de_para_map[str(cod_conta)]
 
+def atualizar_conferido(cod_conta):
+    chave_conf = f"conf_{cod_conta}"
+    if chave_conf in st.session_state:
+        st.session_state.conferidos[str(cod_conta)] = bool(st.session_state[chave_conf])
+
 def format_moeda(valor):
     return f"R$ {valor:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
@@ -59,7 +67,7 @@ def ler_arquivo_texto_seguro(file):
         content = raw_data.decode("latin-1")
     except UnicodeError:
         content = raw_data.decode("cp1252", errors="ignore")
-    return [linha.strip('\r\n') for linha in content.splitlines() if linha.strip()]
+    return [linha.strip('\r\n') for lambda_line in content.splitlines() if (linha := lambda_line.strip())]
 
 # --- SIDEBAR ---
 st.sidebar.header("Configurações")
@@ -124,14 +132,26 @@ if arquivo_backup is not None:
         file_id = f"{arquivo_backup.name}_{arquivo_backup.size}"
         if st.session_state.get("backup_id") != file_id:
             dados = json.load(arquivo_backup)
-            dados_limpos = {str(k): str(v) for k, v in dados.items()}
+            
+            # Detecção inteligente do formato do backup
+            if isinstance(dados, dict) and ("de_para_map" in dados or "conferidos" in dados):
+                mapa_carregado = dados.get("de_para_map", {})
+                conferidos_carregados = dados.get("conferidos", {})
+            else:
+                mapa_carregado = dados
+                conferidos_carregados = {}
+                
+            dados_limpos = {str(k): str(v) for k, v in mapa_carregado.items()}
+            conferidos_limpos = {str(k): bool(v) for k, v in conferidos_carregados.items()}
+            
             st.session_state.de_para_map.update(dados_limpos)
+            st.session_state.conferidos.update(conferidos_limpos)
             
             for cod, val in dados_limpos.items():
                 st.session_state[f"in_{cod}"] = val
             
             st.session_state["backup_id"] = file_id
-            st.sidebar.success(f"Backup carregado! {len(dados_limpos)} contas.")
+            st.sidebar.success(f"Backup carregado! {len(dados_limpos)} mapeadas ({len(conferidos_limpos)} conferidas).")
             st.rerun()
     except Exception as e:
         st.sidebar.error(f"Erro no backup: {e}")
@@ -142,6 +162,7 @@ placeholder_botao_salvar = st.sidebar.empty()
 st.sidebar.divider()
 st.sidebar.header("Filtros de Tela")
 ocultar_mapeadas = st.sidebar.checkbox("Ocultar contas já mapeadas?", value=False)
+ocultar_conferidas = st.sidebar.checkbox("Ocultar contas já conferidas?", value=False)
 
 # --- Lógica Principal ---
 if file_sped and df_novo is not None:
@@ -154,7 +175,10 @@ if file_sped and df_novo is not None:
         df_novo = df_novo[~df_novo['Tipo'].str.startswith(('S', 'SIN'))]
         
     df_novo['Display'] = df_novo['Código'] + " | " + df_novo['Classificação'] + " - " + df_novo['Nome']
-    df_novo['Grupo'] = df_novo['Classificação'].str[0]
+    
+    # --- CORREÇÃO: Ignora os zeros à esquerda da classificação ao extrair o grupo no plano destino ---
+    df_novo['Grupo'] = df_novo['Classificação'].str.strip().str.lstrip('0').str[0]
+    df_novo['Grupo'] = df_novo['Grupo'].fillna("").apply(lambda x: x if x != "" else "0")
 
     content_sped = ler_arquivo_texto_seguro(file_sped)
     
@@ -234,11 +258,17 @@ if file_sped and df_novo is not None:
                         if len(reg[j].strip()) > 2 and not reg[j].replace(".","").isnumeric():
                             nome_conta = reg[j].strip()
                             break
+                    
+                    # --- CORREÇÃO: Remove os zeros à esquerda da classificação de origem para determinar o grupo real ---
+                    classif_raw = reg[pos_classif].strip()
+                    classif_limpa = classif_raw.lstrip('0')
+                    grupo_detectado = classif_limpa[0] if len(classif_limpa) > 0 else (classif_raw[0] if len(classif_raw) > 0 else "")
+                    
                     contas_origem_data.append({
                         "cod": cod_encontrado, 
-                        "classif": reg[pos_classif].strip(), 
+                        "classif": classif_raw, 
                         "nome": nome_conta, 
-                        "grupo": reg[pos_classif][0] if len(reg[pos_classif]) > 0 else ""
+                        "grupo": grupo_detectado
                     })
     
     # --- CORREÇÃO DO ERRO DUPLICATE KEY: Garantir que cada código só apareça UMA VEZ ---
@@ -317,6 +347,21 @@ if file_sped and df_novo is not None:
                 "valor_no_mapa": valor_no_mapa
             })
 
+        # --- SEÇÃO DE PROGRESSO VISUAL ---
+        total_contas = len(df_origem)
+        conferidas_count = sum(1 for k, v in st.session_state.conferidos.items() if v)
+        
+        perc_mapeamento = (total_mapeadas_count / total_contas) if total_contas > 0 else 0.0
+        perc_conferencia = (conferidas_count / total_contas) if total_contas > 0 else 0.0
+
+        st.subheader("📊 Progresso do Trabalho")
+        col_pb1, col_pb2 = st.columns(2)
+        with col_pb1:
+            st.progress(perc_mapeamento, text=f"**Mapeamento Automatizado + Manual:** {total_mapeadas_count}/{total_contas} ({perc_mapeamento * 100:.1f}%)")
+        with col_pb2:
+            st.progress(perc_conferencia, text=f"**Conferência Concluída pelo Cliente:** {conferidas_count}/{total_contas} ({perc_conferencia * 100:.1f}%)")
+        st.divider()
+
         # --- EXIBIÇÃO ---
         st.subheader("🔗 Mapeamento de Contas")
         
@@ -325,19 +370,23 @@ if file_sped and df_novo is not None:
             cod_atual = str(row['cod'])
             resolvida = item['resolvida']
             esta_no_mapa = item['esta_no_mapa']
+            conferida = st.session_state.conferidos.get(cod_atual, False)
             
             if ocultar_mapeadas and resolvida: continue
+            if ocultar_conferidas and conferida: continue
 
             with st.container():
-                col_origem, col_destino = st.columns([1, 1])
+                col_origem, col_destino, col_conferido = st.columns([1, 1, 0.4])
                 with col_origem:
-                    st.markdown(f"**{row['nome']}**")
+                    if conferida:
+                        st.markdown(f"~~{row['nome']}~~  ✅ *(Conferida)*")
+                    else:
+                        st.markdown(f"**{row['nome']}**")
                     st.caption(f"Cod no SPED: {cod_atual} | Grupo: {row['grupo']}")
                 
                 with col_destino:
                     df_opcoes = item['df_opcoes']
                     opcoes = ["-- SELECIONE --", "📝 -- DIGITAR MANUALMENTE --"] + df_opcoes['Display'].tolist()
-                    chave_select = f"sel_{cod_atual}"
                     valor_inicial = opcoes[0]
                     
                     if esta_no_mapa:
@@ -356,40 +405,50 @@ if file_sped and df_novo is not None:
                     elif item['display_sugerido_ia']:
                         if item['display_sugerido_ia'] not in opcoes:
                             opcoes.insert(2, item['display_sugerido_ia'])
-                        if chave_select not in st.session_state:
-                            valor_inicial = item['display_sugerido_ia']
-                        else:
-                            valor_inicial = st.session_state[chave_select]
+                        valor_inicial = item['display_sugerido_ia']
 
-                    if chave_select not in st.session_state:
-                        st.session_state[chave_select] = valor_inicial
+                    if item['is_manual']: 
+                        st.info("📌 Mapeado Manualmente")
+                    elif item['score'] >= 65: 
+                        st.success(f"✅ Sugestão Inteligente ({item['score']}% de compatibilidade)")
+                    else: 
+                        st.warning(f"⚠️ Similaridade baixa ({item['score']}%)")
 
-                    if item['is_manual']: st.info("📌 Mapeado Manualmente")
-                    elif item['score'] >= 65: st.success(f"✅ Sugestão: {item['score']}%")
-                    else: st.warning(f"⚠️ Similaridade baixa ({item['score']}%)")
-
+                    # Evita sticky states indesejados ao recarregar novos planos de contas
+                    idx_inicial = opcoes.index(valor_inicial) if valor_inicial in opcoes else 0
                     escolha = st.selectbox(
-                        label=f"sel_{cod_atual}", options=opcoes, key=chave_select, label_visibility="collapsed"
+                        label=f"sel_{cod_atual}", options=opcoes, index=idx_inicial, key=f"sel_widget_{cod_atual}", label_visibility="collapsed"
                     )
 
-                    novo_valor = None
-                    if escolha == "📝 -- DIGITAR MANUALMENTE --": pass
-                    elif escolha != "-- SELECIONE --":
-                        try:
-                            cod_reduzido = escolha.split(" | ")[0]
-                            if str(cod_reduzido) != item['valor_no_mapa']: novo_valor = str(cod_reduzido)
-                        except: pass
-                    elif escolha == "-- SELECIONE --" and esta_no_mapa:
-                        del st.session_state.de_para_map[cod_atual]
-                        st.rerun()
-
-                    if novo_valor:
-                        st.session_state.de_para_map[cod_atual] = novo_valor
-                        st.rerun()
+                    # Monitoramento de alterações (Apenas grava na memória se o usuário realmente alterar o selectbox)
+                    if escolha != valor_inicial:
+                        if escolha == "-- SELECIONE --":
+                            if cod_atual in st.session_state.de_para_map:
+                                del st.session_state.de_para_map[cod_atual]
+                            st.rerun()
+                        elif escolha == "📝 -- DIGITAR MANUALMENTE --":
+                            st.session_state.de_para_map[cod_atual] = ""
+                            st.rerun()
+                        else:
+                            try:
+                                cod_reduzido = escolha.split(" | ")[0]
+                                st.session_state.de_para_map[cod_atual] = str(cod_reduzido)
+                                st.rerun()
+                            except: pass
 
                     if escolha == "📝 -- DIGITAR MANUALMENTE --":
                         valor_ant = st.session_state.de_para_map.get(cod_atual, "")
                         st.text_input(f"Cód. manual para {cod_atual}:", value=valor_ant, key=f"in_{cod_atual}", on_change=atualizar_manual, args=(cod_atual,))
+                
+                with col_conferido:
+                    st.markdown("<div style='height: 10px;'></div>", unsafe_allow_html=True)
+                    st.checkbox(
+                        "Marcar como Conferido",
+                        key=f"conf_{cod_atual}",
+                        value=conferida,
+                        on_change=atualizar_conferido,
+                        args=(cod_atual,)
+                    )
                 st.markdown("---")
 
         st.divider()
@@ -397,7 +456,7 @@ if file_sped and df_novo is not None:
         perc_concluido = (total_mapeadas_count / len(df_origem)) * 100 if len(df_origem) > 0 else 0
         col_m1.metric("Total", len(df_origem))
         col_m2.metric("Mapeadas", total_mapeadas_count, f"{perc_concluido:.1f}%")
-        col_m3.metric("Pendentes", len(df_origem) - total_mapeadas_count, f"-{len(df_origem) - total_mapeadas_count}", delta_color="inverse")
+        col_m3.metric("Conferidas", conferidas_count, f"{perc_conferencia * 100:.1f}%")
 
         # --- FINALIZAÇÃO ---
         st.divider()
@@ -407,6 +466,7 @@ if file_sped and df_novo is not None:
         # 1. SPED AJUSTADO
         sped_buffer = None
         pendentes = len(df_origem) - total_mapeadas_count
+        pendentes_conferencia = len(df_origem) - conferidas_count
         if pendentes == 0:
             saida = []
             for line in content_sped:
@@ -426,9 +486,14 @@ if file_sped and df_novo is not None:
         with col1:
             st.markdown("**1. Arquivo Final**")
             if pendentes > 0: 
-                st.warning(f"⚠️ Faltam {pendentes}.")
+                st.warning(f"⚠️ Faltam {pendentes} mapeamentos.")
                 st.button("🚀 Gerar SPED", disabled=True) 
             else:
+                if pendentes_conferencia > 0:
+                    st.warning(f"⚠️ {pendentes_conferencia} contas pendentes de conferência.")
+                else:
+                    st.success("✅ Tudo pronto e conferido!")
+                    
                 st.download_button(
                     "💾 Baixar SPED Ajustado", data=sped_buffer, 
                     file_name=f"SPED_AJUSTADO_{nome_empresa}.txt", mime="text/plain", use_container_width=True
@@ -574,5 +639,10 @@ if file_sped and df_novo is not None:
 
 if 'de_para_map' in st.session_state and len(st.session_state.de_para_map) > 0:
     with placeholder_botao_salvar:
-        st.download_button("⬇️ Salvar Progresso Atual", json.dumps(st.session_state.de_para_map, indent=4), "backup_mapeamento_ecd.json", "application/json", help="Baixe para continuar depois.")
+        # Exporta o progresso de mapeamento e de conferência juntos
+        backup_data = {
+            "de_para_map": st.session_state.de_para_map,
+            "conferidos": st.session_state.conferidos
+        }
+        st.download_button("⬇️ Salvar Progresso Atual", json.dumps(backup_data, indent=4), "backup_mapeamento_ecd.json", "application/json", help="Baixe para continuar depois.")
 else: st.info("Aguardando arquivos...")
