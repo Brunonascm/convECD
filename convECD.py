@@ -49,6 +49,8 @@ def atualizar_dropdown(cod_conta, chave_select):
     if valor and valor != "-- SELECIONE --" and "📝" not in valor:
         cod_reduzido = valor.split(" | ")[0]
         st.session_state.de_para_map[str(cod_conta)] = str(cod_reduzido)
+    elif valor == "📝 -- DIGITAR MANUALMENTE --":
+        st.session_state.de_para_map[str(cod_conta)] = ""
     elif valor == "-- SELECIONE --":
         if str(cod_conta) in st.session_state.de_para_map:
             del st.session_state.de_para_map[str(cod_conta)]
@@ -67,15 +69,15 @@ def ler_arquivo_texto_seguro(file):
         content = raw_data.decode("latin-1")
     except UnicodeError:
         content = raw_data.decode("cp1252", errors="ignore")
-    return [linha.strip('\r\n') for lambda_line in content.splitlines() if (linha := lambda_line.strip())]
+    return [linha.strip('\r\n') for linha_crua in content.splitlines() if (linha := linha_crua.strip())]
 
-# --- SIDEBAR ---
-st.sidebar.header("Configurações")
-file_sped = st.sidebar.file_uploader("1. Arquivo SPED (TXT)", type=["txt"])
-usar_padrao = st.sidebar.checkbox("Usar Plano de Contas Padrão UNSÃO?", value=True)
+# --- SIDEBAR: ETAPA 1 - CONFIGURAÇÃO DO PLANO DE CONTAS ---
+st.sidebar.header("1. Plano de Contas Destino")
+usar_padrao = st.sidebar.checkbox("Usar Plano de Contas Padrão?", value=True)
 
-# --- CARREGAMENTO DO PLANO COM SUPORTE À COLUNA DE TIPO ---
 df_novo = None
+plano_carregado = False
+
 if usar_padrao:
     caminho_padrao = "plano_padrao.xlsx"
     if os.path.exists(caminho_padrao):
@@ -87,13 +89,14 @@ if usar_padrao:
             else:
                 df_novo = df_raw.iloc[:, [0, 1, 2]]
                 df_novo.columns = ['Código', 'Classificação', 'Nome']
-                df_novo['Tipo'] = 'A'  # Assume Analítica se não existir
+                df_novo['Tipo'] = 'A'
+            plano_carregado = True
         except:
             st.sidebar.error("Erro ao ler plano_padrao.xlsx")
     else:
         st.sidebar.warning("Arquivo 'plano_padrao.xlsx' não encontrado.")
 else:
-    file_excel = st.sidebar.file_uploader("2. Subir Novo Plano (Excel)", type=["xlsx"])
+    file_excel = st.sidebar.file_uploader("Subir Novo Plano (Excel)", type=["xlsx"])
     
     with st.sidebar.expander("ℹ️ Ver Modelo / Baixar Exemplo"):
         st.write("Seu Excel deve seguir estritamente esta ordem (sem cabeçalho):")
@@ -118,9 +121,20 @@ else:
             else:
                 df_novo = df_raw.iloc[:, [0, 1, 2]]
                 df_novo.columns = ['Código', 'Classificação', 'Nome']
-                df_novo['Tipo'] = 'A'  # Assume Analítica se não existir
+                df_novo['Tipo'] = 'A'
+            plano_carregado = True
         except Exception as e:
             st.sidebar.error(f"Erro ao ler arquivo Excel: {e}")
+
+# --- SIDEBAR: ETAPA 2 - UPLOAD DO SPED (Bloqueado até o plano estar pronto) ---
+file_sped = None
+if plano_carregado:
+    st.sidebar.divider()
+    st.sidebar.header("2. Upload do Arquivo SPED")
+    file_sped = st.sidebar.file_uploader("Subir Arquivo SPED (TXT)", type=["txt"])
+else:
+    st.sidebar.divider()
+    st.sidebar.info("Aguardando definição/upload do Plano de Contas para liberar a importação do SPED.")
 
 # --- SEÇÃO BACKUP ---
 st.sidebar.divider()
@@ -133,7 +147,6 @@ if arquivo_backup is not None:
         if st.session_state.get("backup_id") != file_id:
             dados = json.load(arquivo_backup)
             
-            # Detecção inteligente do formato do backup
             if isinstance(dados, dict) and ("de_para_map" in dados or "conferidos" in dados):
                 mapa_carregado = dados.get("de_para_map", {})
                 conferidos_carregados = dados.get("conferidos", {})
@@ -158,6 +171,38 @@ if arquivo_backup is not None:
 
 placeholder_botao_salvar = st.sidebar.empty()
 
+# --- SEÇÃO MODELO COMPARTILHADO (DE/PARA MULTI-EMPRESAS) ---
+st.sidebar.divider()
+st.sidebar.header("📁 Modelo de DE/PARA Compartilhado")
+st.sidebar.caption("Use para aplicar relacionamentos já prontos em outras empresas com o mesmo plano.")
+
+arquivo_modelo = st.sidebar.file_uploader("Carregar Modelo de DE/PARA (.json)", type=["json"], key="modelo_upload")
+if arquivo_modelo is not None:
+    try:
+        file_id = f"mod_{arquivo_modelo.name}_{arquivo_modelo.size}"
+        if st.session_state.get("modelo_id") != file_id:
+            dados = json.load(arquivo_modelo)
+            
+            if isinstance(dados, dict) and "de_para_map" in dados:
+                mapa_modelo = dados.get("de_para_map", {})
+            else:
+                mapa_modelo = dados
+                
+            dados_limpos = {str(k): str(v) for k, v in mapa_modelo.items()}
+            
+            st.session_state.de_para_map.update(dados_limpos)
+            for k in dados_limpos.keys():
+                st.session_state.conferidos[k] = False
+                st.session_state[f"in_{k}"] = dados_limpos[k]
+                
+            st.session_state["modelo_id"] = file_id
+            st.sidebar.success(f"Modelo aplicado! {len(dados_limpos)} relacionamentos carregados (Aguardando conferência).")
+            st.rerun()
+    except Exception as e:
+        st.sidebar.error(f"Erro no modelo: {e}")
+
+placeholder_botao_modelo = st.sidebar.empty()
+
 # --- FILTROS DE TELA ---
 st.sidebar.divider()
 st.sidebar.header("Filtros de Tela")
@@ -168,21 +213,17 @@ ocultar_conferidas = st.sidebar.checkbox("Ocultar contas já conferidas?", value
 if file_sped and df_novo is not None:
     df_novo = df_novo.astype(str)
     
-    # --- FILTRAR APENAS CONTAS ANALÍTICAS (Ignora Sintéticas no Mapeamento) ---
     if 'Tipo' in df_novo.columns:
         df_novo['Tipo'] = df_novo['Tipo'].str.strip().str.upper()
-        # Remove do dataframe qualquer conta marcada como Sintética
         df_novo = df_novo[~df_novo['Tipo'].str.startswith(('S', 'SIN'))]
         
     df_novo['Display'] = df_novo['Código'] + " | " + df_novo['Classificação'] + " - " + df_novo['Nome']
     
-    # --- CORREÇÃO: Ignora os zeros à esquerda da classificação ao extrair o grupo no plano destino ---
     df_novo['Grupo'] = df_novo['Classificação'].str.strip().str.lstrip('0').str[0]
     df_novo['Grupo'] = df_novo['Grupo'].fillna("").apply(lambda x: x if x != "" else "0")
 
     content_sped = ler_arquivo_texto_seguro(file_sped)
     
-    # --- EXTRAÇÃO DE DADOS DO CABEÇALHO (REGISTRO 0000) ---
     nome_empresa = "EMPRESA"
     dt_inicial_sped = None
     dt_final_sped = None
@@ -204,7 +245,6 @@ if file_sped and df_novo is not None:
                 except: pass
             break
     
-    # --- EXTRAÇÃO INTELIGENTE DOS SALDOS (INICIAIS E FINAIS) ---
     initial_balances = {}
     final_balances = {}
     rtl_count_i150 = 0
@@ -218,20 +258,17 @@ if file_sped and df_novo is not None:
                 cod = reg[2].strip()
                 val_ini_str = reg[4].strip()
                 dc_ini = reg[5].strip()
-                val_fin_str = reg[8].strip()  # Coluna do Saldo Final
-                dc_fin = reg[9].strip()       # Coluna D/C do Saldo Final
+                val_fin_str = reg[8].strip()
+                dc_fin = reg[9].strip()
                 
-                # Saldo Inicial
                 if cod not in initial_balances:
                     if rtl_count_i150 <= 1:
                         initial_balances[cod] = (val_ini_str, dc_ini)
                     else:
                         initial_balances[cod] = ("0,00", dc_ini)
                 
-                # Saldo Final (Sempre atualiza, então a última vez que ele ler a conta será o valor final)
                 final_balances[cod] = (val_fin_str, dc_fin)
             
-    # --- PEGA CONTAS COM MOVIMENTO *OU* COM SALDO PARADO (I155) ---
     contas_com_movimento = set()
     for line in content_sped:
         if line.startswith("|I250|"):
@@ -259,7 +296,6 @@ if file_sped and df_novo is not None:
                             nome_conta = reg[j].strip()
                             break
                     
-                    # --- CORREÇÃO: Remove os zeros à esquerda da classificação de origem para determinar o grupo real ---
                     classif_raw = reg[pos_classif].strip()
                     classif_limpa = classif_raw.lstrip('0')
                     grupo_detectado = classif_limpa[0] if len(classif_limpa) > 0 else (classif_raw[0] if len(classif_raw) > 0 else "")
@@ -271,12 +307,10 @@ if file_sped and df_novo is not None:
                         "grupo": grupo_detectado
                     })
     
-    # --- CORREÇÃO DO ERRO DUPLICATE KEY: Garantir que cada código só apareça UMA VEZ ---
     df_origem = pd.DataFrame(contas_origem_data).drop_duplicates(subset=['cod'])
 
     if not df_origem.empty:
         
-        # --- CÁLCULOS PRINCIPAIS ---
         total_mapeadas_count = 0
         map_final_para_geracao = st.session_state.de_para_map.copy()
         process_data = []
@@ -321,12 +355,9 @@ if file_sped and df_novo is not None:
             valor_no_mapa = str(st.session_state.de_para_map.get(cod_atual, ""))
             
             resolvida = False
-            is_manual = False
             
             if esta_no_mapa:
                 resolvida = True
-                if valor_no_mapa != cod_sugerido_ia:
-                    is_manual = True
             elif score >= 65:
                 resolvida = True
                 map_final_para_geracao[cod_atual] = cod_sugerido_ia
@@ -342,7 +373,6 @@ if file_sped and df_novo is not None:
                 "cod_sugerido_ia": cod_sugerido_ia,
                 "display_sugerido_ia": display_sugerido_ia,
                 "resolvida": resolvida,
-                "is_manual": is_manual,
                 "esta_no_mapa": esta_no_mapa,
                 "valor_no_mapa": valor_no_mapa
             })
@@ -359,18 +389,48 @@ if file_sped and df_novo is not None:
         with col_pb1:
             st.progress(perc_mapeamento, text=f"**Mapeamento Automatizado + Manual:** {total_mapeadas_count}/{total_contas} ({perc_mapeamento * 100:.1f}%)")
         with col_pb2:
-            st.progress(perc_conferencia, text=f"**Conferência Concluída pelo Cliente:** {conferidas_count}/{total_contas} ({perc_conferencia * 100:.1f}%)")
+            st.progress(perc_conferencia, text=f"**Conferência Realizada:** {conferidas_count}/{total_contas} ({perc_conferencia * 100:.1f}%)")
+        
+        # --- BOTÕES DE AÇÃO EM MASSA ---
+        col_btn_massa1, col_btn_massa2, _ = st.columns([1, 1, 2])
+        with col_btn_massa1:
+            if st.button("✅ Marcar Todas como Conferidas", use_container_width=True):
+                for item in process_data:
+                    c_act = str(item['row']['cod'])
+                    if item['resolvida']:
+                        st.session_state.conferidos[c_act] = True
+                        st.session_state[f"conf_{c_act}"] = True
+                st.rerun()
+        with col_btn_massa2:
+            if st.button("❌ Limpar todas as Conferências", use_container_width=True):
+                st.session_state.conferidos = {}
+                for item in process_data:
+                    c_act = str(item['row']['cod'])
+                    st.session_state[f"conf_{c_act}"] = False
+                st.rerun()
+                
         st.divider()
 
-        # --- EXIBIÇÃO ---
+        # --- SEÇÃO DE MAPEAMENTO COM BUSCA INTEGRADA ---
         st.subheader("🔗 Mapeamento de Contas")
         
+        busca_termo = st.text_input("🔍 Buscar conta por nome ou código do SPED:", "").strip().lower()
+        st.markdown("<div style='height: 10px;'></div>", unsafe_allow_html=True)
+
         for item in process_data:
             row = item['row']
             cod_atual = str(row['cod'])
             resolvida = item['resolvida']
             esta_no_mapa = item['esta_no_mapa']
             conferida = st.session_state.conferidos.get(cod_atual, False)
+            
+            # Filtro de Busca Ativa
+            if busca_termo:
+                nome_ok = busca_termo in row['nome'].lower()
+                cod_ok = busca_termo in cod_atual.lower()
+                classif_ok = busca_termo in row['classif'].lower()
+                if not (nome_ok or cod_ok or classif_ok):
+                    continue
             
             if ocultar_mapeadas and resolvida: continue
             if ocultar_conferidas and conferida: continue
@@ -407,34 +467,28 @@ if file_sped and df_novo is not None:
                             opcoes.insert(2, item['display_sugerido_ia'])
                         valor_inicial = item['display_sugerido_ia']
 
-                    if item['is_manual']: 
-                        st.info("📌 Mapeado Manualmente")
+                    # CRITÉRIO DE CORRETUDE VISUAL:
+                    if esta_no_mapa: 
+                        st.info("📌 Mapeado pelo Usuário")
+                    elif item['score'] >= 85: 
+                        st.success(f"🟢 Alta Confiança ({item['score']}% - Recomendada)")
                     elif item['score'] >= 65: 
-                        st.success(f"✅ Sugestão Inteligente ({item['score']}% de compatibilidade)")
+                        st.warning(f"🟡 Média Confiança ({item['score']}% - Requer Revisão)")
                     else: 
-                        st.warning(f"⚠️ Similaridade baixa ({item['score']}%)")
+                        st.error(f"🔴 Não mapeada (Baixa Confiança - {item['score']}%)")
 
-                    # Evita sticky states indesejados ao recarregar novos planos de contas
                     idx_inicial = opcoes.index(valor_inicial) if valor_inicial in opcoes else 0
+                    
+                    # CORREÇÃO: Utilizando "on_change" nativo do widget para garantir commit de dados instantâneo (sem lag)
                     escolha = st.selectbox(
-                        label=f"sel_{cod_atual}", options=opcoes, index=idx_inicial, key=f"sel_widget_{cod_atual}", label_visibility="collapsed"
+                        label=f"sel_{cod_atual}", 
+                        options=opcoes, 
+                        index=idx_inicial, 
+                        key=f"sel_widget_{cod_atual}", 
+                        label_visibility="collapsed",
+                        on_change=atualizar_dropdown,
+                        args=(cod_atual, f"sel_widget_{cod_atual}")
                     )
-
-                    # Monitoramento de alterações (Apenas grava na memória se o usuário realmente alterar o selectbox)
-                    if escolha != valor_inicial:
-                        if escolha == "-- SELECIONE --":
-                            if cod_atual in st.session_state.de_para_map:
-                                del st.session_state.de_para_map[cod_atual]
-                            st.rerun()
-                        elif escolha == "📝 -- DIGITAR MANUALMENTE --":
-                            st.session_state.de_para_map[cod_atual] = ""
-                            st.rerun()
-                        else:
-                            try:
-                                cod_reduzido = escolha.split(" | ")[0]
-                                st.session_state.de_para_map[cod_atual] = str(cod_reduzido)
-                                st.rerun()
-                            except: pass
 
                     if escolha == "📝 -- DIGITAR MANUALMENTE --":
                         valor_ant = st.session_state.de_para_map.get(cod_atual, "")
@@ -442,12 +496,15 @@ if file_sped and df_novo is not None:
                 
                 with col_conferido:
                     st.markdown("<div style='height: 10px;'></div>", unsafe_allow_html=True)
+                    
+                    # CORREÇÃO: Checkbox desabilitado e desmarcado se a conta ainda não estiver mapeada
                     st.checkbox(
                         "Marcar como Conferido",
                         key=f"conf_{cod_atual}",
-                        value=conferida,
+                        value=conferida if resolvida else False,
                         on_change=atualizar_conferido,
-                        args=(cod_atual,)
+                        args=(cod_atual,),
+                        disabled=not resolvida
                     )
                 st.markdown("---")
 
@@ -490,7 +547,7 @@ if file_sped and df_novo is not None:
                 st.button("🚀 Gerar SPED", disabled=True) 
             else:
                 if pendentes_conferencia > 0:
-                    st.warning(f"⚠️ {pendentes_conferencia} contas pendentes de conferência.")
+                    st.warning(f"⚠️ Há {pendentes_conferencia} contas pendentes de conferência pelo cliente. (Download Liberado)")
                 else:
                     st.success("✅ Tudo pronto e conferido!")
                     
@@ -639,10 +696,15 @@ if file_sped and df_novo is not None:
 
 if 'de_para_map' in st.session_state and len(st.session_state.de_para_map) > 0:
     with placeholder_botao_salvar:
-        # Exporta o progresso de mapeamento e de conferência juntos
         backup_data = {
             "de_para_map": st.session_state.de_para_map,
             "conferidos": st.session_state.conferidos
         }
-        st.download_button("⬇️ Salvar Progresso Atual", json.dumps(backup_data, indent=4), "backup_mapeamento_ecd.json", "application/json", help="Baixe para continuar depois.")
+        st.download_button("⬇️ Salvar Backup Total", json.dumps(backup_data, indent=4), "backup_mapeamento_ecd.json", "application/json", help="Salva todo o progresso (incluindo checagens) desta empresa específica.")
+
+    with placeholder_botao_modelo:
+        modelo_data = {
+            "de_para_map": st.session_state.de_para_map
+        }
+        st.download_button("⬇️ Exportar Apenas Modelo (DE/PARA)", json.dumps(modelo_data, indent=4), "modelo_de_para_compartilhado.json", "application/json", help="Exporta apenas o dicionário de relacionamentos para aplicar em outras empresas.")
 else: st.info("Aguardando arquivos...")
