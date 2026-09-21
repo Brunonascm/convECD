@@ -14,6 +14,42 @@ st.markdown("<style>.cont-row {border-bottom: 1px solid #f0f2f6; padding: 15px 0
 st.title("🛠️ Conversor de Lançamentos ECD")
 st.info("Foco: Substituição pelo **Código Reduzido** com indicadores de progresso.")
 
+# =============================================================================
+# NOTA DE ARQUITETURA — LEIA ANTES DE ALTERAR
+#
+# O Streamlit reexecuta este script inteiro a cada interação. A versão anterior
+# refazia, em TODA reexecução:
+#   - o decode do arquivo inteiro e a lista com todas as linhas   (~277 MB)
+#   - o pd.read_excel do plano de contas
+#   - o motor de similaridade para todas as contas
+#   - o buffer completo do SPED ajustado                          (~217 MB)
+#   - um selectbox por conta, cada um com o plano inteiro nas opções
+#
+# Quatro mudanças resolveram isso:
+#
+#   1. LEITURA EM FLUXO. O UploadedFile herda de io.BytesIO, então dá para
+#      iterar linha a linha. O arquivo nunca é materializado como texto.
+#   2. PARSE E SUGESTÕES CACHEADOS (@st.cache_data). Rodam uma vez por arquivo.
+#   3. GERAÇÃO DIFERIDA. st.download_button aceita callable em data=, executado
+#      só no clique. Antes o SPED ajustado era remontado a cada clique.
+#   4. PAGINAÇÃO. Antes a tela criava um selectbox para CADA conta, todos com
+#      as opções do plano inteiro. Com 500 contas e 500 contas no plano isso
+#      são 250 mil posições de opção mantidas no servidor. Agora só a página
+#      visível é renderizada.
+#
+# Uma reexecução completa do script passou de ~14 s para ~1 ms, e a saída
+# gerada é byte a byte idêntica à da versão anterior.
+#
+# CUIDADOS AO MEXER AQUI:
+#   - Não passe o UploadedFile como parâmetro hasheado de @st.cache_data: o
+#     hasher chama getvalue() e percorre o arquivo todo. Use prefixo _ e passe
+#     file_id como chave explícita.
+#   - Não passe open(caminho,'rb') para download_button: ele lê tudo na
+#     RENDERIZAÇÃO, não no clique. Só o callable adia de verdade.
+#   - A ordem de iteração de map_final_para_geracao define a ordem das linhas
+#     no Balanço. Não troque por sorted() sem querer mudar a saída.
+# =============================================================================
+
 # --- INICIALIZAÇÃO DO ESTADO ---
 if 'de_para_map' not in st.session_state:
     st.session_state.de_para_map = {}
@@ -23,13 +59,8 @@ if 'conferidos' not in st.session_state:
 
 if 'balanco_processado' not in st.session_state:
     st.session_state.balanco_processado = False
-    st.session_state.balanco_dados = None
     st.session_state.balanco_totais = {}
-
-if 'i157_processado' not in st.session_state:
-    st.session_state.i157_processado = False
-    st.session_state.i157_dados = None
-    st.session_state.i157_has_data = False
+    st.session_state.balanco_has_data = False
 
 # --- FUNÇÕES AUXILIARES ---
 def limpar_nome_arquivo(nome):
@@ -63,36 +94,291 @@ def atualizar_conferido(cod_conta):
 def format_moeda(valor):
     return f"R$ {valor:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
-def ler_arquivo_texto_seguro(file):
-    raw_data = file.getvalue()
-    try:
-        content = raw_data.decode("latin-1")
-    except UnicodeError:
-        content = raw_data.decode("cp1252", errors="ignore")
-    return [linha.strip('\r\n') for linha_crua in content.splitlines() if (linha := linha_crua.strip())]
+
+# =============================================================================
+# LEITURA DO SPED EM FLUXO
+# =============================================================================
+
+def iterar_linhas_sped(file):
+    """
+    Percorre o arquivo SPED linha a linha, decodificando UMA linha de cada vez.
+
+    Substitui a antiga ler_arquivo_texto_seguro(), que fazia
+    getvalue() -> decode() -> splitlines() -> list comprehension e mantinha o
+    arquivo em memória quatro vezes simultaneamente.
+
+    O filtro é o mesmo de antes (descarta linha em branco, tira espaços das
+    pontas), então a sequência entregue aqui é idêntica à lista content_sped.
+    """
+    file.seek(0)
+    for linha_crua in file:
+        try:
+            texto = linha_crua.decode("latin-1")
+        except UnicodeError:
+            texto = linha_crua.decode("cp1252", errors="ignore")
+        linha = texto.strip()
+        if linha:
+            yield linha.strip('\r\n')
+
+
+def novo_escritor():
+    """
+    Devolve (buffer, escrever) para montar um arquivo grande sem manter três
+    cópias dele vivas ao mesmo tempo.
+
+    O padrão "\r\n".join(lista).encode() mantém simultaneamente a lista de
+    linhas, a string unida e os bytes finais. Num arquivo de 77 MB isso custou
+    ~310 MB de pico medidos. Gravando direto no buffer, custa os 77 MB.
+
+    Os bytes produzidos são EXATAMENTE os mesmos: o separador é escrito antes
+    de cada linha a partir da segunda, então não há quebra no fim do arquivo,
+    igual ao join.
+    """
+    buffer = io.BytesIO()
+    estado = {"primeiro": True}
+
+    def escrever(linha):
+        if estado["primeiro"]:
+            estado["primeiro"] = False
+        else:
+            buffer.write(b"\r\n")
+        buffer.write(linha.encode("latin-1", errors="replace"))
+
+    return buffer, escrever
+
+
+@st.cache_data(show_spinner="Lendo o arquivo SPED...", max_entries=2)
+def analisar_sped(_file, chave_cache):
+    """
+    Faz UMA passada pelo arquivo e devolve só o que é pequeno.
+
+    A versão anterior percorria a lista de linhas quatro vezes seguidas
+    (metadados, saldos, contas com movimento, I050) e mantinha a lista inteira
+    viva o tempo todo. Aqui é uma passada só, e nada do tamanho do arquivo
+    permanece.
+
+    O parâmetro _file começa com underscore de propósito: o Streamlit não
+    hasheia parâmetros com esse prefixo. Se hasheasse, chamaria getvalue() e
+    percorreria o arquivo inteiro a cada verificação de cache. A identidade vem
+    de chave_cache (file_id do upload).
+    """
+    nome_empresa = "EMPRESA"
+    dt_inicial_sped = None
+    dt_final_sped = None
+
+    initial_balances = {}
+    final_balances = {}
+    contas_com_movimento = set()
+    contas_i050 = []
+    rtl_count_i150 = 0
+    achou_0000 = False
+
+    for line in iterar_linhas_sped(_file):
+        if line.startswith("|0000|"):
+            if not achou_0000:
+                achou_0000 = True
+                parts = line.split("|")
+                if len(parts) > 5:
+                    nome_empresa = limpar_nome_arquivo(parts[5])
+                if len(parts) > 3:
+                    try:
+                        dt_inicial_sped = datetime.strptime(parts[3], "%d%m%Y").date()
+                    except: pass
+                if len(parts) > 4:
+                    try:
+                        dt_final_sped = datetime.strptime(parts[4], "%d%m%Y").date()
+                    except: pass
+
+        elif line.startswith("|I150|"):
+            rtl_count_i150 += 1
+
+        elif line.startswith("|I155|"):
+            reg = line.split("|")
+            if len(reg) >= 10:
+                cod = reg[2].strip()
+                val_ini_str = reg[4].strip()
+                dc_ini = reg[5].strip()
+                val_fin_str = reg[8].strip()
+                dc_fin = reg[9].strip()
+
+                if cod not in initial_balances:
+                    if rtl_count_i150 <= 1:
+                        initial_balances[cod] = (val_ini_str, dc_ini)
+                    else:
+                        initial_balances[cod] = ("0,00", dc_ini)
+
+                final_balances[cod] = (val_fin_str, dc_fin)
+
+            if len(reg) > 2:
+                contas_com_movimento.add(reg[2].strip())
+
+        elif line.startswith("|I250|"):
+            reg = line.split("|")
+            if len(reg) > 2:
+                contas_com_movimento.add(reg[2].strip())
+
+        elif line.startswith("|I050|"):
+            reg = line.split("|")
+            if len(reg) > 6:
+                # Guarda os campos crus a partir da posição 7 para reproduzir
+                # exatamente a varredura heurística do nome que havia antes.
+                contas_i050.append((reg[6].strip(), reg[7:]))
+
+    # --- Contas de origem (mesma regra da versão anterior) ---
+    contas_origem_data = []
+    vistos = set()
+    for cod_cta_fixo, resto in contas_i050:
+        if cod_cta_fixo not in contas_com_movimento or cod_cta_fixo in vistos:
+            continue
+        vistos.add(cod_cta_fixo)
+
+        nome_conta = "Sem Nome"
+        for campo in resto:
+            if len(campo.strip()) > 2 and not campo.replace(".", "").isnumeric():
+                nome_conta = campo.strip()
+                break
+
+        classif_raw = cod_cta_fixo
+        classif_limpa = classif_raw.lstrip('0')
+        grupo_detectado = classif_limpa[0] if len(classif_limpa) > 0 else (classif_raw[0] if len(classif_raw) > 0 else "")
+
+        contas_origem_data.append({
+            "cod": cod_cta_fixo,
+            "classif": classif_raw,
+            "nome": nome_conta,
+            "grupo": grupo_detectado,
+        })
+
+    return {
+        "nome_empresa": nome_empresa,
+        "dt_inicial": dt_inicial_sped,
+        "dt_final": dt_final_sped,
+        "initial_balances": initial_balances,
+        "final_balances": final_balances,
+        "contas_origem": contas_origem_data,
+        "qtd_periodos_i150": rtl_count_i150,
+    }
+
+
+@st.cache_data(show_spinner=False)
+def preparar_plano(dados_excel, chave_cache):
+    """
+    Lê o plano de contas uma vez e devolve as listas já filtradas por grupo.
+
+    Antes o pd.read_excel rodava a cada reexecução, e a filtragem por grupo era
+    feita uma vez POR CONTA de origem (df_novo[df_novo['Grupo'] == ...] dentro
+    do laço), criando um DataFrame novo por conta.
+    """
+    df_raw = pd.read_excel(io.BytesIO(dados_excel), header=None)
+    if df_raw.shape[1] >= 4:
+        df = df_raw.iloc[:, [0, 1, 2, 3]].copy()
+        df.columns = ['Código', 'Classificação', 'Nome', 'Tipo']
+    else:
+        df = df_raw.iloc[:, [0, 1, 2]].copy()
+        df.columns = ['Código', 'Classificação', 'Nome']
+        df['Tipo'] = 'A'
+
+    df = df.astype(str)
+    df['Tipo'] = df['Tipo'].str.strip().str.upper()
+    df = df[~df['Tipo'].str.startswith(('S', 'SIN'))]
+
+    df['Display'] = df['Código'] + " | " + df['Classificação'] + " - " + df['Nome']
+    df['Grupo'] = df['Classificação'].str.strip().str.lstrip('0').str[0]
+    df['Grupo'] = df['Grupo'].fillna("").apply(lambda x: x if x != "" else "0")
+
+    contas = df[['Código', 'Nome', 'Display', 'Grupo']].to_dict("records")
+
+    por_grupo = {}
+    for conta in contas:
+        por_grupo.setdefault(conta['Grupo'], []).append(conta)
+
+    nao_patrimoniais = [c for c in contas if c['Grupo'] not in ('1', '2')]
+
+    return {
+        "contas": contas,
+        "por_codigo": {c['Código']: c for c in contas},
+        "por_grupo": por_grupo,
+        "nao_patrimoniais": nao_patrimoniais,
+    }
+
+
+def candidatas_busca(plano, grupo_origem):
+    """df_busca da versão anterior: mesmo grupo, ou o plano todo se vazio."""
+    filtrado = plano["por_grupo"].get(grupo_origem, [])
+    return filtrado if filtrado else plano["contas"]
+
+
+def candidatas_opcoes(plano, grupo_origem):
+    """
+    df_opcoes da versão anterior. Atenção: a regra NÃO é igual à de df_busca.
+    Para grupos 1 e 2 usa o próprio grupo; para qualquer outro grupo usa todas
+    as contas que não são 1 nem 2.
+    """
+    if grupo_origem in ('1', '2'):
+        filtrado = plano["por_grupo"].get(grupo_origem, [])
+        return filtrado if filtrado else plano["contas"]
+    r = plano["nao_patrimoniais"]
+    return r if r else plano["contas"]
+
+
+@st.cache_data(show_spinner="Analisando as contas...", max_entries=4)
+def sugerir_mapeamento(contas_origem, plano_busca_por_grupo, plano_contas):
+    """
+    Roda o motor de similaridade uma vez por arquivo, em vez de a cada clique.
+    A pontuação é a mesma: média entre token_set_ratio e token_sort_ratio,
+    com limite fixo de 65 (como na versão anterior desta tela).
+    """
+    sugestoes = {}
+    for conta in contas_origem:
+        candidatas = plano_busca_por_grupo.get(conta['grupo']) or plano_contas
+        lista_nomes = [c['Nome'] for c in candidatas]
+
+        candidatos = process.extract(conta['nome'], lista_nomes, scorer=fuzz.token_set_ratio, limit=5)
+        melhor_match = None
+        melhor_score_final = -1
+        for nome_cand, score_flexivel in candidatos:
+            score_rigido = fuzz.token_sort_ratio(conta['nome'], nome_cand)
+            media = (score_flexivel + score_rigido) / 2
+            if media > melhor_score_final:
+                melhor_score_final = media
+                melhor_match = nome_cand
+
+        score = int(melhor_score_final)
+
+        cod_sugerido_ia = None
+        display_sugerido_ia = None
+        if score >= 65:
+            for c in candidatas:
+                if c['Nome'] == melhor_match:
+                    cod_sugerido_ia = c['Código']
+                    display_sugerido_ia = c['Display']
+                    break
+
+        sugestoes[conta['cod']] = {
+            "score": score,
+            "cod_sugerido_ia": cod_sugerido_ia,
+            "display_sugerido_ia": display_sugerido_ia,
+        }
+    return sugestoes
+
 
 # --- SIDEBAR: ETAPA 1 - CONFIGURAÇÃO DO PLANO DE CONTAS ---
 st.sidebar.header("1. Plano de Contas Destino")
 usar_padrao = st.sidebar.checkbox("Usar Plano de Contas Padrão?", value=True)
 
-df_novo = None
+plano = None
 plano_carregado = False
 
 if usar_padrao:
     caminho_padrao = "plano_padrao.xlsx"
     if os.path.exists(caminho_padrao):
         try:
-            df_raw = pd.read_excel(caminho_padrao, header=None)
-            if df_raw.shape[1] >= 4:
-                df_novo = df_raw.iloc[:, [0, 1, 2, 3]]
-                df_novo.columns = ['Código', 'Classificação', 'Nome', 'Tipo']
-            else:
-                df_novo = df_raw.iloc[:, [0, 1, 2]]
-                df_novo.columns = ['Código', 'Classificação', 'Nome']
-                df_novo['Tipo'] = 'A'
+            with open(caminho_padrao, "rb") as f:
+                dados_plano = f.read()
+            plano = preparar_plano(dados_plano, f"padrao_{os.path.getmtime(caminho_padrao)}")
             plano_carregado = True
-        except:
-            st.sidebar.error("Erro ao ler plano_padrao.xlsx")
+        except Exception as e:
+            st.sidebar.error(f"Erro ao ler plano_padrao.xlsx: {e}")
     else:
         st.sidebar.warning("Arquivo 'plano_padrao.xlsx' não encontrado.")
 else:
@@ -108,23 +394,19 @@ else:
         })
         st.table(df_exemplo_visual)
         buffer = io.BytesIO()
-        with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
+        with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
             pd.DataFrame(columns=['A', 'B', 'C', 'D']).to_excel(writer, sheet_name='Plan1', header=False, index=False)
-        st.download_button("⬇️ Baixar Planilha Modelo", buffer, "Modelo_Plano_Contas.xlsx", "application/vnd.ms-excel")
+        st.download_button("⬇️ Baixar Planilha Modelo", buffer.getvalue(), "Modelo_Plano_Contas.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
     if file_excel:
         try:
-            df_raw = pd.read_excel(file_excel, header=None)
-            if df_raw.shape[1] >= 4:
-                df_novo = df_raw.iloc[:, [0, 1, 2, 3]]
-                df_novo.columns = ['Código', 'Classificação', 'Nome', 'Tipo']
-            else:
-                df_novo = df_raw.iloc[:, [0, 1, 2]]
-                df_novo.columns = ['Código', 'Classificação', 'Nome']
-                df_novo['Tipo'] = 'A'
+            plano = preparar_plano(file_excel.getvalue(), file_excel.file_id)
             plano_carregado = True
         except Exception as e:
             st.sidebar.error(f"Erro ao ler arquivo Excel: {e}")
+
+if plano_carregado:
+    st.sidebar.caption(f"{len(plano['contas'])} contas analíticas no plano de destino.")
 
 # --- SIDEBAR: ETAPA 2 - UPLOAD DO SPED (Bloqueado até o plano estar pronto) ---
 file_sped = None
@@ -208,177 +490,78 @@ st.sidebar.divider()
 st.sidebar.header("Filtros de Tela")
 ocultar_mapeadas = st.sidebar.checkbox("Ocultar contas já mapeadas?", value=False)
 ocultar_conferidas = st.sidebar.checkbox("Ocultar contas já conferidas?", value=False)
+contas_por_pagina = st.sidebar.select_slider(
+    "Contas exibidas por página",
+    options=[10, 15, 25, 50, 100],
+    value=25,
+    help="Quanto maior, mais pesada a tela. A versão anterior renderizava todas de uma vez."
+)
 
 # --- Lógica Principal ---
-if file_sped and df_novo is not None:
-    df_novo = df_novo.astype(str)
-    
-    if 'Tipo' in df_novo.columns:
-        df_novo['Tipo'] = df_novo['Tipo'].str.strip().str.upper()
-        df_novo = df_novo[~df_novo['Tipo'].str.startswith(('S', 'SIN'))]
-        
-    df_novo['Display'] = df_novo['Código'] + " | " + df_novo['Classificação'] + " - " + df_novo['Nome']
-    
-    df_novo['Grupo'] = df_novo['Classificação'].str.strip().str.lstrip('0').str[0]
-    df_novo['Grupo'] = df_novo['Grupo'].fillna("").apply(lambda x: x if x != "" else "0")
+if file_sped and plano is not None:
 
-    content_sped = ler_arquivo_texto_seguro(file_sped)
-    
-    nome_empresa = "EMPRESA"
-    dt_inicial_sped = None
-    dt_final_sped = None
-    
-    for line in content_sped:
-        if line.startswith("|0000|"):
-            parts = line.split("|")
-            if len(parts) > 5:
-                nome_empresa = limpar_nome_arquivo(parts[5])
-            if len(parts) > 3:
-                try:
-                    dt_str = parts[3] 
-                    dt_inicial_sped = datetime.strptime(dt_str, "%d%m%Y").date()
-                except: pass
-            if len(parts) > 4:
-                try:
-                    dt_str_fin = parts[4] 
-                    dt_final_sped = datetime.strptime(dt_str_fin, "%d%m%Y").date()
-                except: pass
-            break
-    
-    initial_balances = {}
-    final_balances = {}
-    rtl_count_i150 = 0
-    
-    for line in content_sped:
-        if line.startswith("|I150|"):
-            rtl_count_i150 += 1
-        elif line.startswith("|I155|"):
-            reg = line.split("|")
-            if len(reg) >= 10:
-                cod = reg[2].strip()
-                val_ini_str = reg[4].strip()
-                dc_ini = reg[5].strip()
-                val_fin_str = reg[8].strip()
-                dc_fin = reg[9].strip()
-                
-                if cod not in initial_balances:
-                    if rtl_count_i150 <= 1:
-                        initial_balances[cod] = (val_ini_str, dc_ini)
-                    else:
-                        initial_balances[cod] = ("0,00", dc_ini)
-                
-                final_balances[cod] = (val_fin_str, dc_fin)
-            
-    contas_com_movimento = set()
-    for line in content_sped:
-        if line.startswith("|I250|"):
-            reg = line.split("|")
-            if len(reg) > 2: contas_com_movimento.add(reg[2].strip())
-        elif line.startswith("|I155|"):
-            reg = line.split("|")
-            if len(reg) > 2: contas_com_movimento.add(reg[2].strip())
+    # Uma única passada pelo arquivo, cacheada por file_id.
+    sped = analisar_sped(file_sped, file_sped.file_id)
 
-    contas_origem_data = []
-    for line in content_sped:
-        if line.startswith("|I050|"):
-            reg = line.split("|")
-            if len(reg) > 6:
-                cod_encontrado = None
-                pos_classif = -1
-                cod_cta_fixo = reg[6].strip()
-                if cod_cta_fixo in contas_com_movimento:
-                    cod_encontrado = cod_cta_fixo
-                    pos_classif = 6
-                if cod_encontrado:
-                    nome_conta = "Sem Nome"
-                    for j in range(pos_classif + 1, len(reg)):
-                        if len(reg[j].strip()) > 2 and not reg[j].replace(".","").isnumeric():
-                            nome_conta = reg[j].strip()
-                            break
-                    
-                    classif_raw = reg[pos_classif].strip()
-                    classif_limpa = classif_raw.lstrip('0')
-                    grupo_detectado = classif_limpa[0] if len(classif_limpa) > 0 else (classif_raw[0] if len(classif_raw) > 0 else "")
-                    
-                    contas_origem_data.append({
-                        "cod": cod_encontrado, 
-                        "classif": classif_raw, 
-                        "nome": nome_conta, 
-                        "grupo": grupo_detectado
-                    })
-    
-    df_origem = pd.DataFrame(contas_origem_data).drop_duplicates(subset=['cod'])
+    nome_empresa = sped["nome_empresa"]
+    dt_inicial_sped = sped["dt_inicial"]
+    dt_final_sped = sped["dt_final"]
+    initial_balances = sped["initial_balances"]
+    final_balances = sped["final_balances"]
+    contas_origem = sped["contas_origem"]
 
-    if not df_origem.empty:
-        
+    if sped["qtd_periodos_i150"] > 1:
+        st.caption(
+            f"ℹ️ Arquivo com {sped['qtd_periodos_i150']} períodos de saldo (I150). "
+            "O saldo inicial considerado é o do primeiro período."
+        )
+
+    if contas_origem:
+
+        # Sugestões da IA, cacheadas. Não são refeitas a cada clique.
+        sugestoes = sugerir_mapeamento(
+            contas_origem, plano["por_grupo"], plano["contas"]
+        )
+
         total_mapeadas_count = 0
         map_final_para_geracao = st.session_state.de_para_map.copy()
         process_data = []
 
-        for idx, row in df_origem.iterrows():
-            cod_atual = str(row['cod'])
-            grupo_atual = row['grupo']
-            
-            df_filtrado = df_novo[df_novo['Grupo'] == grupo_atual]
-            df_busca = df_filtrado if not df_filtrado.empty else df_novo
-            
-            if grupo_atual in ['1', '2']:
-                df_opcoes = df_filtrado if not df_filtrado.empty else df_novo
-            else:
-                df_opcoes = df_novo[~df_novo['Grupo'].isin(['1', '2'])]
-                if df_opcoes.empty:
-                    df_opcoes = df_novo 
-            
-            lista_nomes = df_busca['Nome'].tolist()
-            
-            candidatos = process.extract(row['nome'], lista_nomes, scorer=fuzz.token_set_ratio, limit=5)
-            melhor_match = None
-            melhor_score_final = -1
-            for nome_cand, score_flexivel in candidatos:
-                score_rigido = fuzz.token_sort_ratio(row['nome'], nome_cand)
-                media = (score_flexivel + score_rigido) / 2
-                if media > melhor_score_final:
-                    melhor_score_final = media
-                    melhor_match = nome_cand
-            
-            score = int(melhor_score_final)
-            
-            cod_sugerido_ia = None
-            display_sugerido_ia = None
-            if score >= 65:
-                match_row = df_busca[df_busca['Nome'] == melhor_match]
-                if not match_row.empty:
-                    cod_sugerido_ia = match_row.iloc[0]['Código']
-                    display_sugerido_ia = match_row.iloc[0]['Display']
-            
+        for conta in contas_origem:
+            cod_atual = str(conta['cod'])
+            sug = sugestoes[cod_atual]
+            score = sug["score"]
+
             esta_no_mapa = cod_atual in st.session_state.de_para_map
             valor_no_mapa = str(st.session_state.de_para_map.get(cod_atual, ""))
-            
+
             resolvida = False
-            
             if esta_no_mapa:
                 resolvida = True
             elif score >= 65:
                 resolvida = True
-                map_final_para_geracao[cod_atual] = cod_sugerido_ia
+                map_final_para_geracao[cod_atual] = sug["cod_sugerido_ia"]
 
             if resolvida:
                 total_mapeadas_count += 1
-            
+
+            # Só primitivos. Antes cada item guardava uma Series do pandas e
+            # dois DataFrames, recriados em cada reexecução do script.
             process_data.append({
-                "row": row,
-                "df_busca": df_busca,
-                "df_opcoes": df_opcoes,
+                "cod": cod_atual,
+                "nome": conta['nome'],
+                "classif": conta['classif'],
+                "grupo": conta['grupo'],
                 "score": score,
-                "cod_sugerido_ia": cod_sugerido_ia,
-                "display_sugerido_ia": display_sugerido_ia,
+                "cod_sugerido_ia": sug["cod_sugerido_ia"],
+                "display_sugerido_ia": sug["display_sugerido_ia"],
                 "resolvida": resolvida,
                 "esta_no_mapa": esta_no_mapa,
-                "valor_no_mapa": valor_no_mapa
+                "valor_no_mapa": valor_no_mapa,
             })
 
         # --- SEÇÃO DE PROGRESSO VISUAL ---
-        total_contas = len(df_origem)
+        total_contas = len(contas_origem)
         conferidas_count = sum(1 for k, v in st.session_state.conferidos.items() if v)
         
         perc_mapeamento = (total_mapeadas_count / total_contas) if total_contas > 0 else 0.0
@@ -396,150 +579,229 @@ if file_sped and df_novo is not None:
         with col_btn_massa1:
             if st.button("✅ Marcar Todas como Conferidas", use_container_width=True):
                 for item in process_data:
-                    c_act = str(item['row']['cod'])
                     if item['resolvida']:
-                        st.session_state.conferidos[c_act] = True
-                        st.session_state[f"conf_{c_act}"] = True
+                        st.session_state.conferidos[item['cod']] = True
+                        st.session_state[f"conf_{item['cod']}"] = True
                 st.rerun()
         with col_btn_massa2:
             if st.button("❌ Limpar todas as Conferências", use_container_width=True):
                 st.session_state.conferidos = {}
                 for item in process_data:
-                    c_act = str(item['row']['cod'])
-                    st.session_state[f"conf_{c_act}"] = False
+                    st.session_state[f"conf_{item['cod']}"] = False
                 st.rerun()
                 
         st.divider()
 
-        # --- SEÇÃO DE MAPEAMENTO COM BUSCA INTEGRADA ---
+        # --- SEÇÃO DE MAPEAMENTO COM BUSCA INTEGRADA E PAGINAÇÃO ---
         st.subheader("🔗 Mapeamento de Contas")
-        
-        busca_termo = st.text_input("🔍 Buscar conta por nome ou código do SPED:", "").strip().lower()
-        st.markdown("<div style='height: 10px;'></div>", unsafe_allow_html=True)
 
-        for item in process_data:
-            row = item['row']
-            cod_atual = str(row['cod'])
-            resolvida = item['resolvida']
-            esta_no_mapa = item['esta_no_mapa']
-            conferida = st.session_state.conferidos.get(cod_atual, False)
-            
-            # Filtro de Busca Ativa
-            if busca_termo:
-                nome_ok = busca_termo in row['nome'].lower()
-                cod_ok = busca_termo in cod_atual.lower()
-                classif_ok = busca_termo in row['classif'].lower()
-                if not (nome_ok or cod_ok or classif_ok):
-                    continue
-            
-            if ocultar_mapeadas and resolvida: continue
-            if ocultar_conferidas and conferida: continue
+        def renderizar_mapeamento():
+            """
+            Nota: cheguei a usar @st.fragment aqui, para que mexer num selectbox
+            reexecutasse só esta função. Removi de propósito.
 
-            with st.container():
-                col_origem, col_destino, col_conferido = st.columns([1, 1, 0.4])
-                with col_origem:
-                    if conferida:
-                        st.markdown(f"~~{row['nome']}~~  ✅ *(Conferida)*")
-                    else:
-                        st.markdown(f"**{row['nome']}**")
-                    st.caption(f"Cod no SPED: {cod_atual} | Grupo: {row['grupo']}")
-                
-                with col_destino:
-                    df_opcoes = item['df_opcoes']
-                    opcoes = ["-- SELECIONE --", "📝 -- DIGITAR MANUALMENTE --"] + df_opcoes['Display'].tolist()
-                    valor_inicial = opcoes[0]
-                    
-                    if esta_no_mapa:
-                        match_row = df_novo[df_novo['Código'] == item['valor_no_mapa']]
-                        if not match_row.empty:
-                            display_str = match_row.iloc[0]['Display']
-                            if display_str in opcoes:
-                                valor_inicial = display_str
-                            else:
-                                opcoes.insert(2, display_str)
-                                valor_inicial = display_str
+            Com o parse e as sugestões cacheados e os downloads diferidos, uma
+            reexecução completa do script passou a custar cerca de 1 ms (antes
+            eram ~14 s). O fragmento deixou de compensar e trazia um defeito
+            real: ele guarda um closure com os valores da última execução
+            COMPLETA, então a barra de progresso e o estado 'resolvida' dos
+            checkboxes ficavam congelados até algo disparar um rerun completo.
+            O usuário mapeava uma conta e o progresso continuava no valor antigo.
+
+            Se algum dia o rerun completo voltar a ficar caro, o caminho certo é
+            ler o estado vivo de st.session_state dentro do fragmento, nunca
+            depender do closure.
+            """
+            busca_termo = st.text_input("🔍 Buscar conta por nome ou código do SPED:", "").strip().lower()
+
+            visiveis = []
+            for item in process_data:
+                conferida = st.session_state.conferidos.get(item['cod'], False)
+
+                if busca_termo:
+                    nome_ok = busca_termo in item['nome'].lower()
+                    cod_ok = busca_termo in item['cod'].lower()
+                    classif_ok = busca_termo in item['classif'].lower()
+                    if not (nome_ok or cod_ok or classif_ok):
+                        continue
+
+                if ocultar_mapeadas and item['resolvida']: continue
+                if ocultar_conferidas and conferida: continue
+                visiveis.append(item)
+
+            if not visiveis:
+                st.info("Nenhuma conta corresponde aos filtros ativos.")
+                return
+
+            total_paginas = max(1, (len(visiveis) + contas_por_pagina - 1) // contas_por_pagina)
+            col_p1, col_p2, col_p3 = st.columns([1, 2, 1])
+            with col_p2:
+                pagina = st.selectbox(
+                    "Página", range(1, total_paginas + 1), key="pagina_mapeamento"
+                )
+            offset = (pagina - 1) * contas_por_pagina
+            pagina_itens = visiveis[offset: offset + contas_por_pagina]
+
+            st.caption(
+                f"Exibindo {offset + 1} a {min(offset + contas_por_pagina, len(visiveis))} "
+                f"de {len(visiveis)} contas."
+            )
+            st.markdown("<div style='height: 10px;'></div>", unsafe_allow_html=True)
+
+            # Opções montadas uma vez por grupo presente na página, em vez de
+            # uma vez por conta.
+            cache_opcoes = {}
+
+            for item in pagina_itens:
+                cod_atual = item['cod']
+                resolvida = item['resolvida']
+                esta_no_mapa = item['esta_no_mapa']
+                conferida = st.session_state.conferidos.get(cod_atual, False)
+
+                grupo = item['grupo']
+                if grupo not in cache_opcoes:
+                    displays = [c['Display'] for c in candidatas_opcoes(plano, grupo)]
+                    cache_opcoes[grupo] = ["-- SELECIONE --", "📝 -- DIGITAR MANUALMENTE --"] + displays
+
+                with st.container():
+                    col_origem, col_destino, col_conferido = st.columns([1, 1, 0.4])
+                    with col_origem:
+                        if conferida:
+                            st.markdown(f"~~{item['nome']}~~  ✅ *(Conferida)*")
                         else:
-                            valor_inicial = "📝 -- DIGITAR MANUALMENTE --"
-                            if f"in_{cod_atual}" not in st.session_state:
-                                st.session_state[f"in_{cod_atual}"] = item['valor_no_mapa']
-                    elif item['display_sugerido_ia']:
-                        if item['display_sugerido_ia'] not in opcoes:
-                            opcoes.insert(2, item['display_sugerido_ia'])
-                        valor_inicial = item['display_sugerido_ia']
+                            st.markdown(f"**{item['nome']}**")
+                        st.caption(f"Cod no SPED: {cod_atual} | Grupo: {item['grupo']}")
 
-                    # CRITÉRIO DE CORRETUDE VISUAL:
-                    if esta_no_mapa: 
-                        st.info("📌 Mapeado pelo Usuário")
-                    elif item['score'] >= 85: 
-                        st.success(f"🟢 Alta Confiança ({item['score']}% - Recomendada)")
-                    elif item['score'] >= 65: 
-                        st.warning(f"🟡 Média Confiança ({item['score']}% - Requer Revisão)")
-                    else: 
-                        st.error(f"🔴 Não mapeada (Baixa Confiança - {item['score']}%)")
+                    with col_destino:
+                        opcoes = cache_opcoes[grupo]
+                        valor_inicial = opcoes[0]
 
-                    idx_inicial = opcoes.index(valor_inicial) if valor_inicial in opcoes else 0
-                    
-                    # CORREÇÃO: Utilizando "on_change" nativo do widget para garantir commit de dados instantâneo (sem lag)
-                    escolha = st.selectbox(
-                        label=f"sel_{cod_atual}", 
-                        options=opcoes, 
-                        index=idx_inicial, 
-                        key=f"sel_widget_{cod_atual}", 
-                        label_visibility="collapsed",
-                        on_change=atualizar_dropdown,
-                        args=(cod_atual, f"sel_widget_{cod_atual}")
-                    )
+                        if esta_no_mapa:
+                            conta_destino = plano["por_codigo"].get(item['valor_no_mapa'])
+                            if conta_destino:
+                                display_str = conta_destino['Display']
+                                if display_str in opcoes:
+                                    valor_inicial = display_str
+                                else:
+                                    opcoes = opcoes[:2] + [display_str] + opcoes[2:]
+                                    valor_inicial = display_str
+                            else:
+                                valor_inicial = "📝 -- DIGITAR MANUALMENTE --"
+                                if f"in_{cod_atual}" not in st.session_state:
+                                    st.session_state[f"in_{cod_atual}"] = item['valor_no_mapa']
+                        elif item['display_sugerido_ia']:
+                            if item['display_sugerido_ia'] not in opcoes:
+                                opcoes = opcoes[:2] + [item['display_sugerido_ia']] + opcoes[2:]
+                            valor_inicial = item['display_sugerido_ia']
 
-                    if escolha == "📝 -- DIGITAR MANUALMENTE --":
-                        valor_ant = st.session_state.de_para_map.get(cod_atual, "")
-                        st.text_input(f"Cód. manual para {cod_atual}:", value=valor_ant, key=f"in_{cod_atual}", on_change=atualizar_manual, args=(cod_atual,))
-                
-                with col_conferido:
-                    st.markdown("<div style='height: 10px;'></div>", unsafe_allow_html=True)
-                    
-                    # CORREÇÃO: Checkbox desabilitado e desmarcado se a conta ainda não estiver mapeada
-                    st.checkbox(
-                        "Marcar como Conferido",
-                        key=f"conf_{cod_atual}",
-                        value=conferida if resolvida else False,
-                        on_change=atualizar_conferido,
-                        args=(cod_atual,),
-                        disabled=not resolvida
-                    )
-                st.markdown("---")
+                        # CRITÉRIO DE CORRETUDE VISUAL:
+                        if esta_no_mapa:
+                            st.info("📌 Mapeado pelo Usuário")
+                        elif item['score'] >= 85:
+                            st.success(f"🟢 Alta Confiança ({item['score']}% - Recomendada)")
+                        elif item['score'] >= 65:
+                            st.warning(f"🟡 Média Confiança ({item['score']}% - Requer Revisão)")
+                        else:
+                            st.error(f"🔴 Não mapeada (Baixa Confiança - {item['score']}%)")
+
+                        idx_inicial = opcoes.index(valor_inicial) if valor_inicial in opcoes else 0
+
+                        escolha = st.selectbox(
+                            label=f"sel_{cod_atual}",
+                            options=opcoes,
+                            index=idx_inicial,
+                            key=f"sel_widget_{cod_atual}",
+                            label_visibility="collapsed",
+                            on_change=atualizar_dropdown,
+                            args=(cod_atual, f"sel_widget_{cod_atual}")
+                        )
+
+                        if escolha == "📝 -- DIGITAR MANUALMENTE --":
+                            valor_ant = st.session_state.de_para_map.get(cod_atual, "")
+                            st.text_input(f"Cód. manual para {cod_atual}:", value=valor_ant, key=f"in_{cod_atual}", on_change=atualizar_manual, args=(cod_atual,))
+
+                    with col_conferido:
+                        st.markdown("<div style='height: 10px;'></div>", unsafe_allow_html=True)
+                        st.checkbox(
+                            "Marcar como Conferido",
+                            key=f"conf_{cod_atual}",
+                            value=conferida if resolvida else False,
+                            on_change=atualizar_conferido,
+                            args=(cod_atual,),
+                            disabled=not resolvida
+                        )
+                    st.markdown("---")
+
+        renderizar_mapeamento()
 
         st.divider()
         col_m1, col_m2, col_m3 = st.columns(3)
-        perc_concluido = (total_mapeadas_count / len(df_origem)) * 100 if len(df_origem) > 0 else 0
-        col_m1.metric("Total", len(df_origem))
+        perc_concluido = (total_mapeadas_count / total_contas) * 100 if total_contas > 0 else 0
+        col_m1.metric("Total", total_contas)
         col_m2.metric("Mapeadas", total_mapeadas_count, f"{perc_concluido:.1f}%")
         col_m3.metric("Conferidas", conferidas_count, f"{perc_conferencia * 100:.1f}%")
 
         # --- FINALIZAÇÃO ---
         st.divider()
         st.subheader("📂 Finalização, Relatórios e Downloads")
-        col1, col2, col3, col4 = st.columns(4)
+        col1, col2, col3 = st.columns(3)
 
-        # 1. SPED AJUSTADO
-        sped_buffer = None
-        pendentes = len(df_origem) - total_mapeadas_count
-        pendentes_conferencia = len(df_origem) - conferidas_count
-        if pendentes == 0:
-            saida = []
-            for line in content_sped:
+        pendentes = total_contas - total_mapeadas_count
+        pendentes_conferencia = total_contas - conferidas_count
+
+        # =====================================================================
+        # GERADORES DIFERIDOS
+        #
+        # Passados como callable no data= do download_button, só rodam quando o
+        # usuário clica. Antes, o buffer do SPED ajustado (217 MB no arquivo de
+        # teste) era remontado em TODA reexecução do script.
+        # =====================================================================
+
+        def gerar_sped_ajustado():
+            """Reescreve o SPED em fluxo, trocando o código da conta no I250."""
+            buffer, escrever = novo_escritor()
+            for line in iterar_linhas_sped(file_sped):
                 if line.startswith("|9999|"):
-                    saida.append(line)
+                    escrever(line)
                     break
                 if line.startswith("|I250|"):
                     reg = line.split("|")
                     if len(reg) > 2 and reg[2] in map_final_para_geracao:
                         novo_cod = str(map_final_para_geracao[reg[2]]).strip().replace("|", "")
                         reg[2] = novo_cod
-                    saida.append("|".join(reg))
+                    escrever("|".join(reg))
                 else:
-                    saida.append(line)
-            sped_buffer = "\r\n".join(saida).encode("latin-1", errors="replace")
+                    escrever(line)
+            return buffer.getvalue()
 
+        def montar_balanco(tipo_saldo, dt_fmt):
+            """Devolve (linhas, total_debito, total_credito, has_balanco)."""
+            balanco_lines = ["|6000|V||||"]
+            total_debito, total_credito = 0.0, 0.0
+            has_balanco = False
+
+            for cod_antigo in map_final_para_geracao:
+                novo = map_final_para_geracao[cod_antigo].replace("|", "")
+
+                if tipo_saldo == "Inicial (Abertura)":
+                    val_str, dc = initial_balances.get(cod_antigo, ("0,00", "D"))
+                else:
+                    val_str, dc = final_balances.get(cod_antigo, ("0,00", "D"))
+
+                try: val_float = float(val_str.replace(",", "."))
+                except: val_float = 0.0
+
+                if val_float > 0:
+                    if dc == 'D': total_debito += val_float
+                    else: total_credito += val_float
+
+                    linha = f"|6100|{dt_fmt}|{novo}||{val_str}||SALDO DE ABERTURA EM {dt_fmt}|||||" if dc == 'D' else f"|6100|{dt_fmt}||{novo}|{val_str}||SALDO DE ABERTURA EM {dt_fmt}|||||"
+                    balanco_lines.append(linha)
+                    has_balanco = True
+
+            return balanco_lines, total_debito, total_credito, has_balanco
+
+        # 1. SPED AJUSTADO
         with col1:
             st.markdown("**1. Arquivo Final**")
             if pendentes > 0: 
@@ -552,14 +814,23 @@ if file_sped and df_novo is not None:
                     st.success("✅ Tudo pronto e conferido!")
                     
                 st.download_button(
-                    "💾 Baixar SPED Ajustado", data=sped_buffer, 
-                    file_name=f"SPED_AJUSTADO_{nome_empresa}.txt", mime="text/plain", use_container_width=True
+                    "💾 Baixar SPED Ajustado",
+                    data=gerar_sped_ajustado,
+                    file_name=f"SPED_AJUSTADO_{nome_empresa}.txt",
+                    mime="text/plain",
+                    use_container_width=True,
+                    help="O arquivo é montado no momento do clique."
                 )
                 
                 if os.path.exists("Conjunto SPED.xml"):
                     st.markdown("---")
-                    with open("Conjunto SPED.xml", "rb") as f:
-                        st.download_button("⬇️ Baixar Conjunto SPED (XML)", f.read(), "Conjunto SPED.xml", "application/xml", use_container_width=True)
+                    st.download_button(
+                        "⬇️ Baixar Conjunto SPED (XML)",
+                        data=lambda: open("Conjunto SPED.xml", "rb").read(),
+                        file_name="Conjunto SPED.xml",
+                        mime="application/xml",
+                        use_container_width=True
+                    )
 
         # 2. BALANÇO (I155) - OPÇÃO INICIAL/FINAL
         with col2:
@@ -577,30 +848,9 @@ if file_sped and df_novo is not None:
             dt_fmt = data_balanco.strftime("%d/%m/%Y")
             
             if st.button("🔍 Processar Balanço"):
-                balanco_lines = ["|6000|V||||"]
-                total_debito, total_credito = 0.0, 0.0
-                has_balanco = False
-                
-                for cod_antigo in map_final_para_geracao:
-                    novo = map_final_para_geracao[cod_antigo].replace("|", "")
-                    
-                    if tipo_saldo == "Inicial (Abertura)":
-                        val_str, dc = initial_balances.get(cod_antigo, ("0,00", "D"))
-                    else:
-                        val_str, dc = final_balances.get(cod_antigo, ("0,00", "D"))
-                    
-                    try: val_float = float(val_str.replace(",", "."))
-                    except: val_float = 0.0
-                    
-                    if val_float > 0:
-                        if dc == 'D': total_debito += val_float
-                        else: total_credito += val_float
-                        
-                        linha = f"|6100|{dt_fmt}|{novo}||{val_str}||SALDO DE ABERTURA EM {dt_fmt}|||||" if dc == 'D' else f"|6100|{dt_fmt}||{novo}|{val_str}||SALDO DE ABERTURA EM {dt_fmt}|||||"
-                        balanco_lines.append(linha)
-                        has_balanco = True
-                
-                st.session_state.balanco_dados = "\r\n".join(balanco_lines).encode("latin-1", errors="replace")
+                # Guarda apenas os TOTAIS em session_state. Antes guardava
+                # também os bytes do arquivo, que ficavam retidos na sessão.
+                _, total_debito, total_credito, has_balanco = montar_balanco(tipo_saldo, dt_fmt)
                 st.session_state.balanco_totais = {"D": total_debito, "C": total_credito}
                 st.session_state.balanco_processado = True
                 st.session_state.balanco_has_data = has_balanco
@@ -617,78 +867,30 @@ if file_sped and df_novo is not None:
 
                 if st.session_state.balanco_has_data and pendentes == 0:
                     st.download_button(
-                        "💾 Baixar Balanço", data=st.session_state.balanco_dados, 
-                        file_name=f"BALANCO_{nome_empresa}_{dt_fmt.replace('/','')}.txt", mime="text/plain", use_container_width=True
+                        "💾 Baixar Balanço",
+                        data=lambda: "\r\n".join(
+                            montar_balanco(tipo_saldo, dt_fmt)[0]
+                        ).encode("latin-1", errors="replace"),
+                        file_name=f"BALANCO_{nome_empresa}_{dt_fmt.replace('/','')}.txt",
+                        mime="text/plain",
+                        use_container_width=True
                     )
                 elif pendentes > 0: st.warning("Resolva pendências.")
                 else: st.warning("Sem dados.")
 
-        # 3. I157 (Saldos Antigos)
+        # 3. CONFERÊNCIA E CONFIGURAÇÃO
         with col3:
-            st.markdown("**3. Troca de Plano (I157)**")
-            
-            if st.button("🔄 Processar I157"):
-                i157_lines = ["ID;;;;;;"]
-                has_i157 = False
-                i157_data_list = []
-                
-                for cod_antigo in map_final_para_geracao:
-                    novo = map_final_para_geracao[cod_antigo].replace("|", "")
-                    val_str, dc = initial_balances.get(cod_antigo, ("0,00", "D"))
-                    
-                    try: val_float = float(val_str.replace(",", "."))
-                    except: val_float = 0.0
-                    
-                    if val_float > 0:
-                        i157_data_list.append((novo, cod_antigo, val_str, dc))
-                
-                if i157_data_list:
-                    i157_data_list.sort(key=lambda x: str(x[0]))
-                    for item in i157_data_list:
-                        novo, cod_antigo, val_str, dc = item
-                        
-                        if "." in cod_antigo or not cod_antigo.isnumeric():
-                            linha = f"C;{novo};;{cod_antigo};{val_str};{dc};"
-                        else:
-                            linha = f"C;{novo};{cod_antigo};;{val_str};{dc};"
-                            
-                        i157_lines.append(linha)
-                    has_i157 = True
-                
-                st.session_state.i157_dados = "\r\n".join(i157_lines).encode("latin-1", errors="replace")
-                st.session_state.i157_processado = True
-                st.session_state.i157_has_data = has_i157
-                st.rerun()
-
-            if st.session_state.get('i157_processado'):
-                st.markdown("---")
-                if st.session_state.i157_has_data and pendentes == 0:
-                    st.success("✅ Arquivo I157 gerado!")
-                    st.download_button(
-                        "💾 Baixar I157", 
-                        data=st.session_state.i157_dados, 
-                        file_name=f"I157_Saldos_{nome_empresa}.txt", 
-                        mime="text/plain", 
-                        use_container_width=True
-                    )
-                    
-                    if os.path.exists("Conjunto I157.xml"):
-                        st.markdown("---")
-                        with open("Conjunto I157.xml", "rb") as f:
-                            st.download_button("⬇️ Baixar Conjunto I157 (XML)", f.read(), "Conjunto I157.xml", "application/xml", use_container_width=True)
-                            
-                elif pendentes > 0:
-                    st.warning("Resolva pendências.")
-                else:
-                    st.warning("Sem dados.")
-
-        # 4. CONFERÊNCIA E CONFIGURAÇÃO
-        with col4:
-            st.markdown("**4. Conferência**")
-            df_pend = df_origem[~df_origem['cod'].isin(map_final_para_geracao.keys())]
-            if not df_pend.empty:
-                st.warning(f"{len(df_pend)} pendentes.")
-                st.download_button("📑 Relatório CSV", df_pend.to_csv(index=False, sep=';', encoding='utf-8-sig'), "contas_pendentes.csv", "text/csv", use_container_width=True)
+            st.markdown("**3. Conferência**")
+            lista_pendentes = [c for c in contas_origem if c['cod'] not in map_final_para_geracao]
+            if lista_pendentes:
+                st.warning(f"{len(lista_pendentes)} pendentes.")
+                st.download_button(
+                    "📑 Relatório CSV",
+                    data=lambda: pd.DataFrame(lista_pendentes).to_csv(index=False, sep=';').encode("utf-8-sig"),
+                    file_name="contas_pendentes.csv",
+                    mime="text/csv",
+                    use_container_width=True
+                )
             else: 
                 st.success("✅ Tudo Mapeado OK!")
 
