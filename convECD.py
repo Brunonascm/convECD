@@ -9,6 +9,10 @@ from datetime import datetime, timedelta
 
 st.set_page_config(page_title="DE/PARA SPED ECD", layout="wide")
 
+st.error("🚫 **Esta ferramenta foi desativada e migrou para um novo endereço.**")
+st.link_button("Acessar a nova ferramenta", "https://brunonascm.github.io/conversorECDdominio/")
+st.stop()
+
 st.markdown("<style>.cont-row {border-bottom: 1px solid #f0f2f6; padding: 15px 0px;}</style>", unsafe_allow_html=True)
 
 st.title("🛠️ Conversor de Lançamentos ECD")
@@ -260,6 +264,38 @@ def analisar_sped(_file, chave_cache):
     }
 
 
+def texto_celula(valor):
+    """
+    Converte o valor de uma célula do Excel em texto, sem inventar decimais.
+
+    O PROBLEMA QUE ISTO RESOLVE:
+    Quando a planilha tem qualquer linha em branco no meio, o pandas precisa
+    representar essas células vazias como NaN. NaN é um float, e isso força a
+    coluna inteira a virar float64. Aí o astype(str) transforma o código 5 em
+    "5.0" e a classificação 1110101001 em "1110101001.0".
+
+    Esse ponto não ficava só na tela: o código ia com o ".0" para o mapa
+    DE/PARA e daí para o arquivo entregue à Domínio, que recusa ou importa na
+    conta errada.
+
+    A leitura agora é feita com dtype=str, o que evita a conversão para float
+    na origem. Isso também protege contra perda de precisão: um float64 não
+    representa inteiros acima de 2^53 com exatidão, então uma classificação
+    muito longa seria corrompida antes mesmo de chegar aqui.
+
+    Esta função é a segunda linha de defesa, para o caso de a célula já vir
+    como número decimal de verdade da planilha.
+    """
+    if valor is None:
+        return ""
+    texto = str(valor).strip()
+    if texto.lower() in ("nan", "nat", "none", "<na>"):
+        return ""
+    if re.fullmatch(r"-?\d+\.0+", texto):
+        texto = texto.split(".")[0]
+    return texto
+
+
 @st.cache_data(show_spinner=False)
 def preparar_plano(dados_excel, chave_cache):
     """
@@ -269,7 +305,9 @@ def preparar_plano(dados_excel, chave_cache):
     feita uma vez POR CONTA de origem (df_novo[df_novo['Grupo'] == ...] dentro
     do laço), criando um DataFrame novo por conta.
     """
-    df_raw = pd.read_excel(io.BytesIO(dados_excel), header=None)
+    # dtype=str impede que o pandas converta código e classificação para
+    # float por causa das linhas em branco. Ver texto_celula() acima.
+    df_raw = pd.read_excel(io.BytesIO(dados_excel), header=None, dtype=str)
     if df_raw.shape[1] >= 4:
         df = df_raw.iloc[:, [0, 1, 2, 3]].copy()
         df.columns = ['Código', 'Classificação', 'Nome', 'Tipo']
@@ -278,8 +316,15 @@ def preparar_plano(dados_excel, chave_cache):
         df.columns = ['Código', 'Classificação', 'Nome']
         df['Tipo'] = 'A'
 
-    df = df.astype(str)
-    df['Tipo'] = df['Tipo'].str.strip().str.upper()
+    for coluna in ('Código', 'Classificação', 'Nome', 'Tipo'):
+        df[coluna] = df[coluna].map(texto_celula)
+
+    # Linha sem código ou sem nome é linha em branco da planilha. Sem este
+    # filtro, as 90 linhas vazias de um plano real viravam contas "nan"
+    # selecionáveis no menu suspenso.
+    df = df[(df['Código'] != "") & (df['Nome'] != "")]
+
+    df['Tipo'] = df['Tipo'].str.upper()
     df = df[~df['Tipo'].str.startswith(('S', 'SIN'))]
 
     df['Display'] = df['Código'] + " | " + df['Classificação'] + " - " + df['Nome']
